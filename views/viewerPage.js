@@ -85,6 +85,7 @@ html, body {
 <select id="cameraMode">
   <option value="overview">Overview</option>
   <option value="follow">Follow</option>
+  <option value="chase">Chase</option>
 </select>
 
 <label for="speedSelect">Speed</label>
@@ -179,6 +180,56 @@ function setFollowCamera() {
   viewer.scene.preRender.addEventListener(followHandler);
 }
 
+function setChaseCamera() {
+  if (!viewer || !currentEntity) {
+    return;
+  }
+
+  removeFollowMode();
+
+  followHandler = function () {
+    const currentTime = viewer.clock.currentTime;
+    const position = currentEntity.position.getValue(currentTime);
+
+    if (!position) {
+      return;
+    }
+
+    const nextTime = Cesium.JulianDate.addSeconds(
+      currentTime,
+      10,
+      new Cesium.JulianDate()
+    );
+    const nextPosition = currentEntity.position.getValue(nextTime);
+
+    let heading = 0;
+
+    if (nextPosition) {
+      const currentCarto = Cesium.Cartographic.fromCartesian(position);
+      const nextCarto = Cesium.Cartographic.fromCartesian(nextPosition);
+
+      const dLon = nextCarto.longitude - currentCarto.longitude;
+      const dLat = nextCarto.latitude - currentCarto.latitude;
+
+      heading = Math.atan2(dLon, dLat);
+    }
+
+    viewer.camera.lookAt(
+      position,
+      new Cesium.HeadingPitchRange(
+        heading,
+        Cesium.Math.toRadians(-35),
+        500000
+      )
+    );
+  };
+
+  viewer.scene.preRender.addEventListener(followHandler);
+}
+
+
+
+
 function removeFollowMode() {
   if (followHandler && viewer) {
     viewer.scene.preRender.removeEventListener(followHandler);
@@ -194,6 +245,8 @@ function removeFollowMode() {
 function applyCameraMode() {
   if (cameraMode === "follow") {
     setFollowCamera();
+  } else if (cameraMode === "chase") {
+    setChaseCamera();
   } else {
     setOverviewCamera();
   }
