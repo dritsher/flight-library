@@ -9,6 +9,7 @@ const app = express();
 const PORT = 3002;
 
 app.use(express.json());
+app.use("/models", express.static("/opt/flight-library/app/public/models"));
 app.use(apiRoutes);
 app.use(pageRoutes);
 

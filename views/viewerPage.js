@@ -81,6 +81,10 @@ html, body {
 
       <div id="details"></div>
 
+<label>
+  <input type="checkbox" id="showModel" checked>
+  Show aircraft model
+</label>
 <label for="cameraMode">Camera mode</label>
 <select id="cameraMode">
   <option value="overview">Overview</option>
@@ -135,6 +139,11 @@ document.getElementById("speedSelect").addEventListener("change", function (even
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;");
     }
+
+function shouldShowModel() {
+  const checkbox = document.getElementById("showModel");
+  return !!checkbox && checkbox.checked;
+}
 
 function setOverviewCamera() {
   if (!viewer || !currentBoundingSphere) {
@@ -274,6 +283,10 @@ function setLeadCamera() {
   viewer.scene.preRender.addEventListener(followHandler);
 }
 
+function getAircraftModelUri(metadata) {
+//  return "/models/Cesium_Air.glb";
+  return "/models/a320/glTF2/A320.glb";
+}
 
 
 
@@ -447,7 +460,7 @@ console.log("last time", points[points.length - 1].time);
     const position = Cesium.Cartesian3.fromDegrees(
       point.lon,
       point.lat,
-      point.alt || 0
+      (point.alt || 0) + 1000
     );
     positionProperty.addSample(time, position);
   }
@@ -488,25 +501,77 @@ if (viewer.timeline) {
 }
 
 
-  const entity = viewer.entities.add({
-    availability: new Cesium.TimeIntervalCollection([
-      new Cesium.TimeInterval({ start: start, stop: stop })
-    ]),
-    position: positionProperty,
-    point: {
-      pixelSize: 10,
-      color: Cesium.Color.RED
-    },
-    path: {
-      show: true,
-      resolution: 1,
-      leadTime: 0,
-      trailTime: 1e9,
-      width: 3,
-      material: Cesium.Color.YELLOW
-    },
-    description: metadata.title || metadata.id
-  });
+const modelUri = shouldShowModel() ? getAircraftModelUri(metadata) : null;
+console.log("[model] uri", modelUri);
+
+const velocityOrientation = new Cesium.VelocityOrientationProperty(positionProperty);
+
+const entity = viewer.entities.add({
+  availability: new Cesium.TimeIntervalCollection([
+    new Cesium.TimeInterval({ start: start, stop: stop })
+  ]),
+  position: positionProperty,
+  orientation: new Cesium.CallbackProperty(function (time, result) {
+    const position = positionProperty.getValue(time);
+    if (!position) {
+      return result;
+    }
+
+const nextTime = Cesium.JulianDate.addSeconds(
+      time,
+      1,
+      new Cesium.JulianDate()
+    );
+    const nextPosition = positionProperty.getValue(nextTime);
+
+    if (!nextPosition) {
+      return result;
+    }
+
+    const currentCarto = Cesium.Cartographic.fromCartesian(position);
+    const nextCarto = Cesium.Cartographic.fromCartesian(nextPosition);
+
+    const dLon = nextCarto.longitude - currentCarto.longitude;
+    const dLat = nextCarto.latitude - currentCarto.latitude;
+
+    const heading = Math.atan2(dLon, dLat);
+
+    return Cesium.Transforms.headingPitchRollQuaternion(
+      position,
+      new Cesium.HeadingPitchRoll(
+        heading + Cesium.Math.toRadians(0), // keep your 90° model correction
+        0,
+        0
+      ),
+      Cesium.Ellipsoid.WGS84,
+      Cesium.Transforms.eastNorthUpToFixedFrame,
+      result || new Cesium.Quaternion()
+    );
+  }, false),
+    model: modelUri ? {
+    uri: modelUri,
+    minimumPixelSize: 128,
+    maximumScale: 100000,
+    scale: 20,
+    runAnimations: false
+  } : undefined,
+  point: modelUri ? undefined : {
+    pixelSize: 8,
+    color: Cesium.Color.RED
+  },
+  path: {
+    show: true,
+    resolution: 1,
+    leadTime: 0,
+    trailTime: 1e9,
+    width: 3,
+    material: Cesium.Color.YELLOW
+  },
+  description: metadata.title || metadata.id
+});
+
+console.log("[model] entity created", entity);
+console.log("[model] graphics", entity.model);
 
 currentEntity = entity;
 
