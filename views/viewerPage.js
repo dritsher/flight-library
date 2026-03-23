@@ -128,6 +128,12 @@ document.getElementById("speedSelect").addEventListener("change", function (even
   }
 });
 
+document.getElementById("showModel").addEventListener("change", async function () {
+  if (currentProjectId && currentFlightId && viewer) {
+    const savedTime = Cesium.JulianDate.clone(viewer.clock.currentTime);
+    await loadCurrentFlight(savedTime);
+  }
+});
 
     function setStatus(text) {
       document.getElementById("status").textContent = text;
@@ -401,7 +407,7 @@ setTimeout(function () {
 
 
 
-async function renderFlight(projectId, flightId) {
+async function renderFlight(projectId, flightId, preserveTime) {
   setStatus("Loading flight...");
 
   const metadata = await loadFlightMetadata(projectId, flightId);
@@ -490,7 +496,7 @@ currentBoundingSphere = Cesium.BoundingSphere.fromPoints(polylinePositions);
 
   viewer.clock.startTime = start.clone();
   viewer.clock.stopTime = stop.clone();
-  viewer.clock.currentTime = start.clone();
+  viewer.clock.currentTime = preserveTime || start.clone();
   viewer.clock.clockRange = Cesium.ClockRange.CLAMPED;
   viewer.clock.clockStep = Cesium.ClockStep.SYSTEM_CLOCK_MULTIPLIER;
   viewer.clock.multiplier = 100;
@@ -555,7 +561,9 @@ const nextTime = Cesium.JulianDate.addSeconds(
     scale: 20,
     runAnimations: false
   } : undefined,
-  point: modelUri ? undefined : {
+  point: modelUri ? {
+      show: false
+  } : {
     pixelSize: 8,
     color: Cesium.Color.RED
   },
@@ -637,7 +645,7 @@ applyCameraMode();
 
 
 
-    async function loadCurrentFlight() {
+    async function loadCurrentFlight(preserveTime) {
       currentProjectId = document.getElementById("projectSelect").value;
       currentFlightId = document.getElementById("flightSelect").value;
 
@@ -647,7 +655,7 @@ applyCameraMode();
       }
 
       try {
-        await renderFlight(currentProjectId, currentFlightId);
+        await renderFlight(currentProjectId, currentFlightId, preserveTime);
       } catch (err) {
         console.error(err);
         setStatus(err.message || "Could not load flight.");
