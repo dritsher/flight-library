@@ -86,6 +86,7 @@ html, body {
   <option value="overview">Overview</option>
   <option value="follow">Follow</option>
   <option value="chase">Chase</option>
+  <option value="lead">Lead</option>
 </select>
 
 <label for="speedSelect">Speed</label>
@@ -227,6 +228,52 @@ function setChaseCamera() {
   viewer.scene.preRender.addEventListener(followHandler);
 }
 
+function setLeadCamera() {
+  if (!viewer || !currentEntity) {
+    return;
+  }
+
+  removeFollowMode();
+
+  followHandler = function () {
+    const currentTime = viewer.clock.currentTime;
+
+    const position = currentEntity.position.getValue(currentTime);
+    if (!position) return;
+
+    const leadTime = Cesium.JulianDate.addSeconds(
+      currentTime,
+      20,
+      new Cesium.JulianDate()
+    );
+
+    const leadPosition = currentEntity.position.getValue(leadTime);
+
+    if (!leadPosition) return;
+
+    // Compute heading (direction of travel)
+    const currentCarto = Cesium.Cartographic.fromCartesian(position);
+    const leadCarto = Cesium.Cartographic.fromCartesian(leadPosition);
+
+    const dLon = leadCarto.longitude - currentCarto.longitude;
+    const dLat = leadCarto.latitude - currentCarto.latitude;
+
+    const heading = Math.atan2(dLon, dLat);
+
+    // Place camera at lead position, looking back toward aircraft
+    viewer.camera.lookAt(
+      leadPosition,
+      new Cesium.HeadingPitchRange(
+        heading, //Looks forward  + Math.PI, // turn around to look back
+        Cesium.Math.toRadians(-20),
+        10
+      )
+    );
+  };
+
+  viewer.scene.preRender.addEventListener(followHandler);
+}
+
 
 
 
@@ -242,16 +289,18 @@ function removeFollowMode() {
   }
 }
 
+
 function applyCameraMode() {
   if (cameraMode === "follow") {
     setFollowCamera();
   } else if (cameraMode === "chase") {
     setChaseCamera();
+  } else if (cameraMode === "lead") {
+    setLeadCamera();
   } else {
     setOverviewCamera();
   }
 }
-
     async function loadProjects() {
       const res = await fetch("/flight-api/projects");
       const data = await res.json();
