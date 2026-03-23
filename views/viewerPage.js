@@ -1,5 +1,5 @@
 function viewerPage({ cesiumToken = "" } = {}) {
-return `<!doctype html>
+  return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -61,10 +61,102 @@ html, body {
     a {
       text-decoration: none;
     }
+#sidebarToggle {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 20;
+  width: 40px;
+  height: 40px;
+  border: 1px solid #bbb;
+  background: white;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+#app.sidebar-collapsed {
+  grid-template-columns: 0 minmax(0, 1fr);
+}
+
+#app.sidebar-collapsed #sidebar {
+  padding: 0;
+  border-right: none;
+  overflow: hidden;
+}
+
+#app.sidebar-collapsed #sidebar > * {
+  display: none;
+}
+
+#timelinePanel {
+  margin-top: 20px;
+}
+
+#timelineReadout {
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
+#timelineWrap {
+  display: flex;
+  justify-content: center;
+  margin: 12px 0 16px 0;
+}
+
+#verticalTimeline {
+  position: relative;
+  width: 44px;
+  height: 320px;
+  user-select: none;
+  touch-action: none;
+}
+
+#timelineTrack {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  transform: translateX(-50%);
+  width: 8px;
+  height: 100%;
+  background: #ddd;
+  border-radius: 999px;
+}
+
+#timelinePlayhead {
+  position: absolute;
+  left: 50%;
+  width: 28px;
+  height: 4px;
+  background: #d22;
+  transform: translateX(-50%);
+  border-radius: 999px;
+}
+
+.timelineMarker {
+  position: absolute;
+  left: 50%;
+  width: 36px;
+  height: 3px;
+  transform: translateX(-50%);
+  border-radius: 999px;
+}
+
+.timelineMarker.in {
+  background: #1a7f37;
+}
+
+.timelineMarker.out {
+  background: #b54708;
+}
+
+#timelineButtons button {
+  margin-bottom: 8px;
+}
   </style>
 </head>
 <body>
   <div id="app">
+    <button id="sidebarToggle" title="Toggle sidebar">☰</button>
     <div id="sidebar">
       <h2>Flight Viewer</h2>
       <div id="status">Loading...</div>
@@ -85,6 +177,10 @@ html, body {
   <input type="checkbox" id="showModel" checked>
   Show aircraft model
 </label>
+<label>
+  <input type="checkbox" id="showTrackLine" checked>
+  Show blue track line
+</label>
 <label for="cameraMode">Camera mode</label>
 <select id="cameraMode">
   <option value="overview">Overview</option>
@@ -100,6 +196,32 @@ html, body {
   <option value="100" selected>100x</option>
   <option value="200">200x</option>
 </select>
+<h3>Timeline</h3>
+
+<div id="timelinePanel">
+  <div id="timelineReadout">
+    <div><strong>Current:</strong> <span id="currentTimeLabel">--</span></div>
+    <div><strong>In:</strong> <span id="inTimeLabel">--</span></div>
+    <div><strong>Out:</strong> <span id="outTimeLabel">--</span></div>
+  </div>
+
+  <div id="timelineWrap">
+    <div id="verticalTimeline">
+      <div id="timelineTrack"></div>
+      <div id="timelineInMarker" class="timelineMarker in"></div>
+      <div id="timelineOutMarker" class="timelineMarker out"></div>
+      <div id="timelinePlayhead"></div>
+    </div>
+  </div>
+
+  <div id="timelineButtons">
+    <button id="markInButton" type="button">Mark In</button>
+    <button id="markOutButton" type="button">Mark Out</button>
+    <button id="jumpInButton" type="button">Jump to In</button>
+    <button id="jumpOutButton" type="button">Jump to Out</button>
+    <button id="resetRangeButton" type="button">Reset Range</button>
+  </div>
+</div>
     </div>
       <div id="cesiumPane">
     <div id="cesiumContainer"></div>
@@ -116,6 +238,13 @@ let cameraMode = "overview";
 let followHandler = null;
 let currentBoundingSphere = null;
 let currentEntity = null;
+
+let flightStartJulian = null;
+let flightStopJulian = null;
+let inPointJulian = null;
+let outPointJulian = null;
+
+let currentTrackEntity = null;
 
 document.getElementById("cameraMode").addEventListener("change", function (event) {
   cameraMode = event.target.value;
@@ -135,6 +264,7 @@ document.getElementById("showModel").addEventListener("change", async function (
   }
 });
 
+//// HELPER FUNCTIONS /////
     function setStatus(text) {
       document.getElementById("status").textContent = text;
     }
@@ -146,10 +276,152 @@ document.getElementById("showModel").addEventListener("change", async function (
         .replace(/>/g, "&gt;");
     }
 
+function formatJulian(julian) {
+  if (!julian) return "--";
+  const jsDate = Cesium.JulianDate.toDate(julian);
+  return jsDate.toISOString().replace("T", " ").replace("Z", " UTC");
+}
+
+function clamp01(value) {
+  return Math.max(0, Math.min(1, value));
+}
+
+function getTimelineRatio(time) {
+  if (!flightStartJulian || !flightStopJulian || !time) return 0;
+
+  const total = Cesium.JulianDate.secondsDifference(flightStopJulian, flightStartJulian);
+  if (total <= 0) return 0;
+
+  const elapsed = Cesium.JulianDate.secondsDifference(time, flightStartJulian);
+  return clamp01(elapsed / total);
+}
+
+function julianFromTimelineRatio(ratio) {
+  if (!flightStartJulian || !flightStopJulian) return null;
+
+  const total = Cesium.JulianDate.secondsDifference(flightStopJulian, flightStartJulian);
+  const seconds = total * clamp01(ratio);
+
+  return Cesium.JulianDate.addSeconds(
+    flightStartJulian,
+    seconds,
+    new Cesium.JulianDate()
+  );
+}
+
+function setTimelineElementPosition(element, ratio) {
+  const trackHeight = 320;
+  const y = (1 - clamp01(ratio)) * trackHeight;
+  element.style.top = y + "px";
+}
+
+function updateTimelineUI() {
+  if (!viewer || !flightStartJulian || !flightStopJulian) return;
+
+  const currentRatio = getTimelineRatio(viewer.clock.currentTime);
+  const inRatio = getTimelineRatio(inPointJulian || flightStartJulian);
+  const outRatio = getTimelineRatio(outPointJulian || flightStopJulian);
+
+  setTimelineElementPosition(document.getElementById("timelinePlayhead"), currentRatio);
+  setTimelineElementPosition(document.getElementById("timelineInMarker"), inRatio);
+  setTimelineElementPosition(document.getElementById("timelineOutMarker"), outRatio);
+
+  document.getElementById("currentTimeLabel").textContent = formatJulian(viewer.clock.currentTime);
+  document.getElementById("inTimeLabel").textContent = formatJulian(inPointJulian);
+  document.getElementById("outTimeLabel").textContent = formatJulian(outPointJulian);
+}
+
+function jumpToTime(julian) {
+  if (!viewer || !julian) return;
+  viewer.clock.currentTime = Cesium.JulianDate.clone(julian);
+  viewer.scene.requestRender();
+}
+
+
 function shouldShowModel() {
   const checkbox = document.getElementById("showModel");
   return !!checkbox && checkbox.checked;
 }
+
+/////// TIMELINE SETUP
+function installTimelineHandlers() {
+  const timeline = document.getElementById("verticalTimeline");
+
+  let dragging = false;
+
+  function setTimeFromPointer(clientY) {
+    const rect = timeline.getBoundingClientRect();
+    const y = clientY - rect.top;
+    const ratio = 1 - clamp01(y / rect.height);
+    const newTime = julianFromTimelineRatio(ratio);
+
+    if (newTime && viewer) {
+      viewer.clock.currentTime = newTime;
+      viewer.scene.requestRender();
+      updateTimelineUI();
+    }
+  }
+
+  timeline.addEventListener("pointerdown", function (event) {
+    dragging = true;
+    setTimeFromPointer(event.clientY);
+  });
+
+  window.addEventListener("pointermove", function (event) {
+    if (!dragging) return;
+    setTimeFromPointer(event.clientY);
+  });
+
+  window.addEventListener("pointerup", function () {
+    dragging = false;
+  });
+}
+
+
+function installTimelineButtons() {
+  document.getElementById("markInButton").addEventListener("click", function () {
+    if (!viewer) return;
+    inPointJulian = Cesium.JulianDate.clone(viewer.clock.currentTime);
+    updateTimelineUI();
+  });
+
+  document.getElementById("markOutButton").addEventListener("click", function () {
+    if (!viewer) return;
+    outPointJulian = Cesium.JulianDate.clone(viewer.clock.currentTime);
+    updateTimelineUI();
+  });
+
+  document.getElementById("jumpInButton").addEventListener("click", function () {
+    jumpToTime(inPointJulian);
+  });
+
+  document.getElementById("jumpOutButton").addEventListener("click", function () {
+    jumpToTime(outPointJulian);
+  });
+
+  document.getElementById("resetRangeButton").addEventListener("click", function () {
+    if (!flightStartJulian || !flightStopJulian) return;
+    inPointJulian = Cesium.JulianDate.clone(flightStartJulian);
+    outPointJulian = Cesium.JulianDate.clone(flightStopJulian);
+    updateTimelineUI();
+  });
+}
+
+function installSidebarToggle() {
+  const app = document.getElementById("app");
+  const button = document.getElementById("sidebarToggle");
+
+  button.addEventListener("click", function () {
+    app.classList.toggle("sidebar-collapsed");
+    if (viewer) {
+      setTimeout(function () {
+        viewer.resize();
+      }, 0);
+    }
+  });
+}
+
+
 
 function setOverviewCamera() {
   if (!viewer || !currentBoundingSphere) {
@@ -395,6 +667,30 @@ viewer = new Cesium.Viewer("cesiumContainer", {
 
 //    viewer.scene.requestRenderMode = false;
 
+if (!viewer.__timelineUpdaterInstalled) {
+  viewer.__timelineUpdaterInstalled = true;
+
+  viewer.scene.postRender.addEventListener(function () {
+    updateTimelineUI();
+  });
+}
+
+
+viewer.scene.light = new Cesium.SunLight({
+  color: Cesium.Color.WHITE,
+  intensity: 3.0
+});
+viewer.scene.globe.enableLighting = true;
+viewer.scene.skyAtmosphere.show = true;
+viewer.scene.globe.showGroundAtmosphere = true;
+viewer.shadows = true;
+viewer.scene.shadowMap.enabled = true;
+viewer.scene.shadowMap.softShadows = true;
+viewer.scene.moon.show = true;
+viewer.scene.sun.show = true;
+viewer.scene.skyBox.show = true;
+viewer.scene.skyAtmosphere.show = true;
+
     console.log("viewer initialized", viewer);
 setTimeout(function () {
   viewer.resize();
@@ -433,6 +729,7 @@ console.log("[renderFlight] start", {
   viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
 
   viewer.entities.removeAll();
+  currentTrackEntity = null;
   viewer.trackedEntity = undefined;
 
 console.log("[renderFlight] after cleanup", {
@@ -466,7 +763,7 @@ console.log("last time", points[points.length - 1].time);
     const position = Cesium.Cartesian3.fromDegrees(
       point.lon,
       point.lat,
-      (point.alt || 0) + 1000
+      (point.alt || 0)
     );
     positionProperty.addSample(time, position);
   }
@@ -480,7 +777,7 @@ console.log("last time", points[points.length - 1].time);
     Cesium.Cartesian3.fromDegrees(point.lon, point.lat, point.alt || 0)
   );
 
-  viewer.entities.add({
+  currentTrackEntity = viewer.entities.add({
     polyline: {
       positions: polylinePositions,
       width: 2,
@@ -488,11 +785,19 @@ console.log("last time", points[points.length - 1].time);
     }
   });
 
+const showTrackCheckbox = document.getElementById("showTrackLine");
+currentTrackEntity.show = !showTrackCheckbox || showTrackCheckbox.checked;
+
 const boundingSphere = Cesium.BoundingSphere.fromPoints(polylinePositions);
 currentBoundingSphere = Cesium.BoundingSphere.fromPoints(polylinePositions);
 
   const start = Cesium.JulianDate.fromIso8601(points[0].time);
   const stop = Cesium.JulianDate.fromIso8601(points[points.length - 1].time);
+flightStartJulian = start.clone();
+flightStopJulian = stop.clone();
+inPointJulian = start.clone();
+outPointJulian = stop.clone();
+
 
   viewer.clock.startTime = start.clone();
   viewer.clock.stopTime = stop.clone();
@@ -559,7 +864,10 @@ const nextTime = Cesium.JulianDate.addSeconds(
     minimumPixelSize: 128,
     maximumScale: 100000,
     scale: 20,
-    runAnimations: false
+    runAnimations: false,
+    //silhouetteColor: Cesium.Color.BLACK,
+    //silhouetteSize: 1,
+    shadows: Cesium.ShadowMode.ENABLED
   } : undefined,
   point: modelUri ? {
       show: false
@@ -639,6 +947,7 @@ setTimeout(function () {
   window.history.replaceState({}, "", url.toString());
 
 applyCameraMode();
+updateTimelineUI();
 
   setStatus("Loaded.");
 }
@@ -668,12 +977,22 @@ applyCameraMode();
       await loadFlights(currentProjectId);
     });
 
+    document.getElementById("showTrackLine").addEventListener("change", function (event) {
+      if (currentTrackEntity) {
+        currentTrackEntity.show = event.target.checked;
+      }
+    });
+
     document.getElementById("loadButton").addEventListener("click", async () => {
       await loadCurrentFlight();
     });
 
     async function init() {
       try {
+installSidebarToggle();
+installTimelineHandlers();
+installTimelineButtons();
+
         await loadProjects();
         await loadFlights(currentProjectId);
         if (currentProjectId && currentFlightId) {
@@ -694,5 +1013,5 @@ applyCameraMode();
 }
 
 module.exports = {
-  viewerPage
+  viewerPage,
 };
