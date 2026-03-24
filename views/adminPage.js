@@ -168,9 +168,106 @@ function adminPage() {
             <a href="\${flight.viewerUrl}" target="_blank">View in Cesium</a>
             <a href="\${flight.rawUrl}" target="_blank">Download raw KML</a>
             <a href="\${flight.trackUrl}" target="_blank">Open processed JSON</a>
+            <button class="appendButton" data-flight-id="\${flight.id}" type="button">Append KML</button>
+            <button class="deleteFlightButton" data-flight-id="\${flight.id}" type="button">Delete Flight</button>
           </div>
         </div>
       \`).join("");
+    container.querySelectorAll(".appendButton").forEach((button) => {
+  button.addEventListener("click", async function () {
+    const flightId = button.getAttribute("data-flight-id");
+
+    const fileInput = document.createElement("input");
+    fileInput.type = "file";
+    fileInput.accept = ".kml";
+    fileInput.multiple = true;
+
+    fileInput.addEventListener("change", async function () {
+      if (!fileInput.files || fileInput.files.length === 0) {
+        return;
+      }
+
+      const formData = new FormData();
+      for (const file of fileInput.files) {
+        formData.append("kmlFiles", file);
+      }
+
+      const uploadMessage = document.getElementById("uploadMessage");
+      uploadMessage.className = "";
+      uploadMessage.textContent = "Appending KML...";
+
+      const res = await fetch(
+        "/flight-api/projects/" +
+          encodeURIComponent(projectId) +
+          "/flights/" +
+          encodeURIComponent(flightId) +
+          "/append",
+        {
+          method: "POST",
+          body: formData
+        }
+      );
+
+      const result = await res.json();
+
+      if (!res.ok) {
+        uploadMessage.className = "error";
+        uploadMessage.textContent = result.error || "Append failed.";
+        return;
+      }
+
+      uploadMessage.className = "success";
+      uploadMessage.textContent =
+        "Appended " +
+        result.appendedPoints +
+        " point(s). Total points: " +
+        result.totalPoints;
+
+      await loadFlights(projectId);
+    });
+
+    fileInput.click();
+  });
+});
+
+container.querySelectorAll(".deleteFlightButton").forEach((button) => {
+  button.addEventListener("click", async function () {
+    const flightId = button.getAttribute("data-flight-id");
+
+    const confirmed = window.confirm("Delete flight " + flightId + "?");
+    if (!confirmed) {
+      return;
+    }
+
+    const uploadMessage = document.getElementById("uploadMessage");
+    uploadMessage.className = "";
+    uploadMessage.textContent = "Deleting flight...";
+
+    const res = await fetch(
+      "/flight-api/projects/" +
+        encodeURIComponent(projectId) +
+        "/flights/" +
+        encodeURIComponent(flightId),
+      {
+        method: "DELETE"
+      }
+    );
+
+    const result = await res.json();
+
+    if (!res.ok) {
+      uploadMessage.className = "error";
+      uploadMessage.textContent = result.error || "Delete failed.";
+      return;
+    }
+
+    uploadMessage.className = "success";
+    uploadMessage.textContent = "Deleted flight " + flightId + ".";
+
+    await loadFlights(projectId);
+  });
+});
+
     }
 
     document.getElementById("projectForm").addEventListener("submit", async (event) => {

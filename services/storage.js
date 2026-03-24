@@ -116,11 +116,26 @@ async function saveFlightArtifacts(projectId, originalFilename, parsedTrack) {
   const lastPoint = parsedTrack.points[parsedTrack.points.length - 1] || null;
   const now = new Date().toISOString();
 
+  let dateStr = "";
+
+  if (firstPoint && firstPoint.time) { 
+    const d = new Date(firstPoint.time);
+    if (!Number.isNaN(d.getTime())) {
+      dateStr = d.toISOString().slice(0, 10);
+    }
+  }
+
+  const baseTitle = parsedTrack.title || base;
+
+  const titleWithDate = dateStr
+    ? baseTitle.replace(/\s*track$/i, "") + "-" + dateStr + " track"
+    : baseTitle;
+
   const processed = {
     flight: {
       id: finalFlightId,
       projectId,
-      title: parsedTrack.title || base,
+      title: titleWithDate,
       sourceFilename: originalFilename,
       timeMode: parsedTrack.timeMode
     },
@@ -130,7 +145,7 @@ async function saveFlightArtifacts(projectId, originalFilename, parsedTrack) {
   const metadata = {
     id: finalFlightId,
     projectId,
-    title: parsedTrack.title || base,
+    title: titleWithDate,
     source: "kml_upload",
     rawFile: "raw/" + originalFilename,
     processedFile: "processed/" + processedFilename,
@@ -163,6 +178,82 @@ async function saveFlightArtifacts(projectId, originalFilename, parsedTrack) {
   return metadata;
 }
 
+//////////////////////
+///  HELPERS  ////////
+//////////////////////
+
+async function getFlightTrack(projectId, flightId) {
+  const fullPath = path.join(PROJECTS_DIR, projectId, "processed", path.basename(flightId) + ".json");
+  if (!fs.existsSync(fullPath)) return null;
+  return JSON.parse(await fsp.readFile(fullPath, "utf8"));
+}
+
+function dedupeTrackPoints(points) {
+  const deduped = [];
+  let lastKey = null;
+
+  for (const point of points) {
+    const key = point.time + "|" + point.lat + "|" + point.lon + "|" + point.alt;
+    if (key !== lastKey) {
+      deduped.push(point);
+      lastKey = key;
+    }
+  }
+
+  return deduped;
+}
+
+async function saveUpdatedFlightTrack(projectId, flightId, mergedPoints, existingMetadata) {
+  const processedPath = path.join(PROJECTS_DIR, projectId, "processed", path.basename(flightId) + ".json");
+  const metadataPath = path.join(PROJECTS_DIR, projectId, "metadata", path.basename(flightId) + ".json");
+
+  const firstPoint = mergedPoints[0] || null;
+  const lastPoint = mergedPoints[mergedPoints.length - 1] || null;
+
+  const processed = {
+    flight: {
+      id: existingMetadata.id,
+      projectId,
+      title: existingMetadata.title,
+      sourceFilename: existingMetadata.rawFile || "",
+      timeMode: existingMetadata.timeMode
+    },
+    points: mergedPoints
+  };
+
+  const metadata = {
+    ...existingMetadata,
+    pointCount: mergedPoints.length,
+    startTime: firstPoint ? firstPoint.time : null,
+    endTime: lastPoint ? lastPoint.time : null,
+    updatedAt: new Date().toISOString()
+  };
+
+  await fsp.writeFile(processedPath, JSON.stringify(processed, null, 2), "utf8");
+  await fsp.writeFile(metadataPath, JSON.stringify(metadata, null, 2), "utf8");
+
+  return metadata;
+}
+
+async function deleteFlight(projectId, flightId) {
+  const processedPath = path.join(PROJECTS_DIR, projectId, "processed", path.basename(flightId) + ".json");
+  const metadataPath = path.join(PROJECTS_DIR, projectId, "metadata", path.basename(flightId) + ".json");
+
+  let deleted = false;
+
+  if (fs.existsSync(processedPath)) {
+    await fsp.unlink(processedPath);
+    deleted = true;
+  }
+
+  if (fs.existsSync(metadataPath)) {
+    await fsp.unlink(metadataPath);
+    deleted = true;
+  }
+
+  return deleted;
+}
+
 module.exports = {
   ROOT,
   PROJECTS_DIR,
@@ -175,5 +266,9 @@ module.exports = {
   getProject,
   listProjectFlights,
   getFlightMetadata,
-  saveFlightArtifacts
+  getFlightTrack,
+  dedupeTrackPoints,
+  saveFlightArtifacts,
+  saveUpdatedFlightTrack,
+  deleteFlight
 };

@@ -1,4 +1,4 @@
-function viewerPage({ cesiumToken = "" } = {}) {
+function viewerPage({ cesiumToken = "", maptilerApiKey = "" } = {}) {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -181,12 +181,17 @@ html, body {
   <input type="checkbox" id="showTrackLine" checked>
   Show blue track line
 </label>
+<select id="modelSelect">
+  <option value="">Auto</option>
+</select>
 <label for="cameraMode">Camera mode</label>
 <select id="cameraMode">
   <option value="overview">Overview</option>
   <option value="follow">Follow</option>
   <option value="chase">Chase</option>
   <option value="lead">Lead</option>
+  <option value="side">Side</option>
+  <option value="tail">Tail</option>
 </select>
 
 <label for="speedSelect">Speed</label>
@@ -257,6 +262,15 @@ html, body {
     <button id="jumpOutButton" type="button">Jump to Out</button>
     <button id="resetRangeButton" type="button">Reset Range</button>
   </div>
+  <label for="basemapSelect">Basemap</label>
+  <select id="basemapSelect">
+    <option value="cesium-default">Cesium Default</option>
+<!--//    <option value="maptiler-streets">MapTiler Streets</option>
+//    <option value="maptiler-satellite">MapTiler Satellite</option>
+//      <option value="cesium-night">Earth at Night</option>
+--!>      <option value="arcgis-satellite">ArcGIS Satellite</option>
+      <option value="arcgis-hillshade">ArcGIS Hillshade</option>
+  </select>
 </div>
     </div>
       <div id="cesiumPane">
@@ -271,6 +285,7 @@ html, body {
     let viewer = null;
 
 let cameraMode = "overview";
+let currentBasemap = "cesium-default";
 let followHandler = null;
 let currentBoundingSphere = null;
 let currentEntity = null;
@@ -281,10 +296,22 @@ let inPointJulian = null;
 let outPointJulian = null;
 
 let currentTrackEntity = null;
+let userHasManuallySelectedModel = false;
 
-document.getElementById("cameraMode").addEventListener("change", function (event) {
+let availableModels = [];
+let registrationMap = {};
+let modelsByAircraftType = {};
+
+const MAPTILER_API_KEY = ${JSON.stringify(maptilerApiKey)};
+
+document.getElementById("cameraMode").addEventListener("change", async function (event) {
   cameraMode = event.target.value;
-  applyCameraMode();
+    if (viewer && currentProjectId && currentFlightId) {
+    const savedTime = Cesium.JulianDate.clone(viewer.clock.currentTime);
+    await loadCurrentFlight(savedTime);
+  } else {
+    applyCameraMode();
+  }
 });
 
 document.getElementById("speedSelect").addEventListener("change", function (event) {
@@ -316,6 +343,250 @@ document.getElementById("captureFrame").addEventListener("click", function () {
 ///////////////////////////
 //// HELPER FUNCTIONS /////
 ///////////////////////////
+
+async function createImageryProviderForBasemap(basemap) {
+  if (basemap === "maptiler-streets") {
+    return new Cesium.UrlTemplateImageryProvider({
+      url:
+        "https://api.maptiler.com/maps/streets-v2/256/{z}/{x}/{y}.png?key=" +
+        encodeURIComponent(MAPTILER_API_KEY),
+      credit: "© MapTiler © OpenStreetMap contributors"
+    });
+  }
+
+  if (basemap === "maptiler-satellite") {
+    return new Cesium.UrlTemplateImageryProvider({
+      url:
+        "https://api.maptiler.com/tiles/satellite-v2/256/{z}/{x}/{y}.jpg?key=" +
+        encodeURIComponent(MAPTILER_API_KEY),
+      credit: "© MapTiler"
+    });
+  }
+
+  if (basemap === "cesium-night") {
+    return await Cesium.IonImageryProvider.fromAssetId(3812);
+  }
+
+  if (basemap === "arcgis-satellite") {
+    return await Cesium.ArcGisMapServerImageryProvider.fromBasemapType(
+      Cesium.ArcGisBaseMapType.SATELLITE
+    );
+  }
+
+  if (basemap === "arcgis-hillshade") {
+    return await Cesium.ArcGisMapServerImageryProvider.fromBasemapType(
+      Cesium.ArcGisBaseMapType.HILLSHADE
+    );
+  }
+
+  return await Cesium.IonImageryProvider.fromAssetId(2);
+}
+
+async function applyBasemap(basemap) {
+  if (!viewer) return;
+
+  const provider = await createImageryProviderForBasemap(basemap);
+
+  viewer.imageryLayers.removeAll();
+  viewer.imageryLayers.addImageryProvider(provider);
+
+  currentBasemap = basemap;
+}
+
+function densifyTrackPoints(points, maxStepSeconds = 30) {
+  if (!Array.isArray(points) || points.length < 2) {
+    return points || [];
+  }
+
+  const densified = [];
+
+  for (let i = 0; i < points.length - 1; i += 1) {
+    const a = points[i];
+    const b = points[i + 1];
+
+    densified.push(a);
+
+    const t1 = new Date(a.time).getTime();
+    const t2 = new Date(b.time).getTime();
+    const dtSeconds = (t2 - t1) / 1000;
+
+    if (!Number.isFinite(dtSeconds) || dtSeconds <= maxStepSeconds) {
+      continue;
+    }
+
+    const steps = Math.floor(dtSeconds / maxStepSeconds);
+
+    for (let s = 1; s <= steps; s += 1) {
+      const ratio = s / (steps + 1);
+
+      densified.push({
+        time: new Date(t1 + ratio * (t2 - t1)).toISOString(),
+        lat: a.lat + (b.lat - a.lat) * ratio,
+        lon: a.lon + (b.lon - a.lon) * ratio,
+        alt: (a.alt || 0) + ((b.alt || 0) - (a.alt || 0)) * ratio
+      });
+    }
+  }
+
+  densified.push(points[points.length - 1]);
+  return densified;
+}
+
+function densifyTrackPointsGeodesic(points, maxStepSeconds = 30) {
+  if (!Array.isArray(points) || points.length < 2) {
+    return points || [];
+  }
+
+  const densified = [];
+
+  for (let i = 0; i < points.length - 1; i += 1) {
+    const a = points[i];
+    const b = points[i + 1];
+
+    densified.push(a);
+
+    const t1 = new Date(a.time).getTime();
+    const t2 = new Date(b.time).getTime();
+    const dtSeconds = (t2 - t1) / 1000;
+
+    if (!Number.isFinite(dtSeconds) || dtSeconds <= maxStepSeconds) {
+      continue;
+    }
+
+    const startCartographic = Cesium.Cartographic.fromDegrees(a.lon, a.lat);
+    const endCartographic = Cesium.Cartographic.fromDegrees(b.lon, b.lat);
+    const geodesic = new Cesium.EllipsoidGeodesic(startCartographic, endCartographic);
+
+    const steps = Math.floor(dtSeconds / maxStepSeconds);
+
+    for (let s = 1; s <= steps; s += 1) {
+      const ratio = s / (steps + 1);
+
+      const cartographic = geodesic.interpolateUsingFraction(ratio);
+
+      densified.push({
+        time: new Date(t1 + ratio * (t2 - t1)).toISOString(),
+        lat: Cesium.Math.toDegrees(cartographic.latitude),
+        lon: Cesium.Math.toDegrees(cartographic.longitude),
+        alt: (a.alt || 0) + ((b.alt || 0) - (a.alt || 0)) * ratio
+      });
+    }
+  }
+
+  densified.push(points[points.length - 1]);
+  return densified;
+}
+
+
+function inferAircraftType(metadata) {
+  const text = ((metadata.title || "") + " " + (metadata.id || "")).toUpperCase();
+
+  if (text.includes("A320")) return "A320";
+  if (text.includes("A321")) return "A321";
+  if (text.includes("A319")) return "A319";
+  if (text.includes("B738") || text.includes("737-800")) return "B738";
+  if (text.includes("B739") || text.includes("737-900")) return "B739";
+  if (text.includes("B737") || text.includes("737")) return "B737";
+  if (text.includes("B752") || text.includes("757-200")) return "B752";
+  if (text.includes("B763") || text.includes("767-300")) return "B763";
+  if (text.includes("B762") || text.includes("767-200")) return "B762";
+  if (text.includes("B777") || text.includes("777")) return "B777";
+  if (text.includes("B787") || text.includes("787")) return "B787";
+  if (text.includes("C172") || text.includes("CESSNA 172")) return "C172";
+  if (text.includes("PC12") || text.includes("PILATUS PC-12")) return "PC12";
+
+  return "";
+}
+
+async function loadModelConfig() {
+  const [modelsRes, registrationsRes] = await Promise.all([
+    fetch("/flight-api/models"),
+    fetch("/flight-api/registrations")
+  ]);
+
+  const modelsData = await modelsRes.json();
+  const registrationsData = await registrationsRes.json();
+
+  if (!modelsRes.ok) {
+    throw new Error(modelsData.error || "Could not load model library");
+  }
+
+  if (!registrationsRes.ok) {
+    throw new Error(registrationsData.error || "Could not load registrations");
+  }
+
+  availableModels = modelsData.models || [];
+  modelsByAircraftType = {};
+
+  for (const model of availableModels) {
+    modelsByAircraftType[model.aircraftType] = model;
+  }
+
+  registrationMap = {};
+
+  for (const row of registrationsData.registrations || []) {
+    registrationMap[row.registration] = {
+      aircraftType: row.aircraftType,
+      livery: row.livery || "default"
+    };
+  }
+}
+
+
+function extractRegistration(metadata) {
+  const text = [
+    metadata.title || "",
+    metadata.id || "",
+    metadata.rawFile || "",
+    metadata.sourceFilename || ""
+  ].join(" ").toUpperCase();
+
+  console.log("[extractRegistration text]", text);
+
+  const match = text.match(/N[0-9A-Z]{2,6}/);
+  console.log("[extractRegistration match]", match);
+
+  return match ? match[0] : "";
+}
+
+
+function chooseModelForFlight(metadata) {
+  const manualAircraftType = document.getElementById("modelSelect")?.value || "";
+
+  if (manualAircraftType) {
+    return modelsByAircraftType[manualAircraftType] || null;
+  }
+
+  const registration = extractRegistration(metadata);
+
+  if (registration && registrationMap[registration]) {
+    const mappedType = registrationMap[registration].aircraftType;
+    if (mappedType && modelsByAircraftType[mappedType]) {
+      return modelsByAircraftType[mappedType];
+    }
+  }
+
+  const inferredType = inferAircraftType(metadata);
+
+  if (inferredType && modelsByAircraftType[inferredType]) {
+    return modelsByAircraftType[inferredType];
+  }
+
+  return modelsByAircraftType["GENERIC"] || null;
+}
+
+
+
+function populateModelPicker() {
+  const select = document.getElementById("modelSelect");
+  if (!select) return;
+
+  select.innerHTML =
+    '<option value="">Auto</option>' +
+    availableModels.map((model) =>
+      '<option value="' + model.aircraftType + '">' + model.label + " (" + model.aircraftType + ")</option>"
+    ).join("");
+}
 
 
 function setExportProgress(current, total) {
@@ -853,6 +1124,14 @@ async function exportFramesFromRange() {
 // Camera Views
 // --------------------
 
+function getModelScaleMultiplierForCameraMode() {
+  if (cameraMode === "overview" || cameraMode === "follow" || cameraMode === "chase") {
+    return 500;
+  }
+
+  return 1;
+}
+
 function setOverviewCamera() {
   if (!viewer || !currentBoundingSphere) {
     return;
@@ -890,7 +1169,7 @@ function setFollowCamera() {
       new Cesium.HeadingPitchRange(
         0,
         Cesium.Math.toRadians(-85),
-        1500000
+        150000
       )
     );
   };
@@ -937,7 +1216,7 @@ function setChaseCamera() {
       new Cesium.HeadingPitchRange(
         heading,
         Cesium.Math.toRadians(-35),
-        500000
+        50000
       )
     );
   };
@@ -991,6 +1270,112 @@ function setLeadCamera() {
   viewer.scene.preRender.addEventListener(followHandler);
 }
 
+function setSideCamera() {
+  if (!viewer || !currentEntity) {
+    return;
+  }
+
+  removeFollowMode();
+
+  followHandler = function () {
+    const position = currentEntity.position.getValue(viewer.clock.currentTime);
+    const orientation =
+      currentEntity.orientation &&
+      currentEntity.orientation.getValue(viewer.clock.currentTime);
+
+    if (!position || !orientation) {
+      return;
+    }
+
+    const rotation = Cesium.Matrix3.fromQuaternion(orientation);
+    const bodyTransform = Cesium.Matrix4.fromRotationTranslation(rotation, position);
+
+    // +Y = one side of aircraft body frame. Use -250 for the opposite side.
+    const offset = new Cesium.Cartesian3(-23, 50, 12);
+
+    const cameraPosition = Cesium.Matrix4.multiplyByPoint(
+      bodyTransform,
+      offset,
+      new Cesium.Cartesian3()
+    );
+
+    const direction = Cesium.Cartesian3.normalize(
+      Cesium.Cartesian3.subtract(position, cameraPosition, new Cesium.Cartesian3()),
+      new Cesium.Cartesian3()
+    );
+
+    const enu = Cesium.Transforms.eastNorthUpToFixedFrame(position);
+    const up = Cesium.Matrix4.multiplyByPointAsVector(
+      enu,
+      Cesium.Cartesian3.UNIT_Z,
+      new Cesium.Cartesian3()
+    );
+    Cesium.Cartesian3.normalize(up, up);
+
+    viewer.camera.setView({
+      destination: cameraPosition,
+      orientation: {
+        direction,
+        up
+      }
+    });
+  };
+
+  viewer.scene.preRender.addEventListener(followHandler);
+}
+
+
+function setTailCamera() {
+  if (!viewer || !currentEntity) {
+    return;
+  }
+
+  removeFollowMode();
+
+  followHandler = function () {
+    const position = currentEntity.position.getValue(viewer.clock.currentTime);
+    const orientation = currentEntity.orientation && currentEntity.orientation.getValue(viewer.clock.currentTime);
+
+    if (!position || !orientation) {
+      return;
+    }
+
+    const rotation = Cesium.Matrix3.fromQuaternion(orientation);
+    const transform = Cesium.Matrix4.fromRotationTranslation(rotation, position);
+
+    const offset = new Cesium.Cartesian3(-30, 2, 9);
+    const cameraPosition = Cesium.Matrix4.multiplyByPoint(
+      transform,
+      offset,
+      new Cesium.Cartesian3()
+    );
+
+    const direction = Cesium.Cartesian3.normalize(
+      Cesium.Cartesian3.subtract(position, cameraPosition, new Cesium.Cartesian3()),
+      new Cesium.Cartesian3()
+    );
+
+    const localUp = Cesium.Matrix4.multiplyByPointAsVector(
+      transform,
+      Cesium.Cartesian3.UNIT_Z,
+      new Cesium.Cartesian3()
+    );
+    Cesium.Cartesian3.normalize(localUp, localUp);
+
+    viewer.camera.setView({
+      destination: cameraPosition,
+      orientation: {
+        direction: direction,
+        up: localUp
+      }
+    });
+  };
+
+  viewer.scene.preRender.addEventListener(followHandler);
+}
+
+
+
 function getAircraftModelUri(metadata) {
 //  return "/models/Cesium_Air.glb";
   return "/models/a320/glTF2/A320.glb";
@@ -1018,10 +1403,20 @@ function applyCameraMode() {
     setChaseCamera();
   } else if (cameraMode === "lead") {
     setLeadCamera();
+  } else if (cameraMode === "side") {
+    setSideCamera();
+  } else if (cameraMode === "tail") {
+    setTailCamera();
   } else {
     setOverviewCamera();
   }
 }
+
+////////////////////////////
+/////////  LOADERs /////////
+////////////////////////////
+
+
     async function loadProjects() {
       const res = await fetch("/flight-api/projects");
       const data = await res.json();
@@ -1072,6 +1467,30 @@ function applyCameraMode() {
       return data;
     }
 
+    async function loadAvailableModels() {
+      const res = await fetch("/flight-api/models");
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error || "Could not load model library");
+      }
+
+      availableModels = data.models || [];
+      modelsByAircraftType = {};
+
+      for (const model of availableModels) {
+        modelsByAircraftType[model.aircraftType] = model;
+      }
+    }
+
+
+
+
+////////////////////////////////
+/////////// VIEWER /////////////
+////////////////////////////////
+
+
 function initViewer() {
   if (viewer) {
     return;
@@ -1100,6 +1519,9 @@ viewer = new Cesium.Viewer("cesiumContainer", {
   }
 });
 
+setTimeout(async function () {
+  await applyBasemap(currentBasemap);
+}, 0);
 //    viewer.scene.requestRenderMode = false;
 
 if (!viewer.__timelineUpdaterInstalled) {
@@ -1144,6 +1566,25 @@ async function renderFlight(projectId, flightId, preserveTime) {
   const metadata = await loadFlightMetadata(projectId, flightId);
   const track = await loadTrack(projectId, flightId);
 
+console.log("[model picker] selected", document.getElementById("modelSelect")?.value);
+  const selectedModel = chooseModelForFlight(metadata);
+console.log("[registration]", extractRegistration(metadata));
+console.log("[selected model]", selectedModel);
+  if (!userHasManuallySelectedModel && selectedModel && selectedModel.aircraftType) {
+    const modelSelect = document.getElementById("modelSelect");
+
+    if (modelSelect && !modelSelect.value) {
+      modelSelect.value = selectedModel.aircraftType;
+    }
+  }
+
+
+  const modelUri = shouldShowModel() && selectedModel ? selectedModel.uri : null;
+
+  const modelScale = selectedModel ? selectedModel.scale : 20;
+  const effectiveModelScale = modelScale * getModelScaleMultiplierForCameraMode();
+  const headingOffsetDeg = selectedModel ? selectedModel.headingOffsetDeg : 0;
+console.log("[model chosen]", selectedModel);
 
   initViewer();
 
@@ -1191,14 +1632,15 @@ if (!viewer.__cameraChangedInstalled) {
 console.log("first time", points[0].time);
 console.log("last time", points[points.length - 1].time);
 
+  const animationPoints = densifyTrackPointsGeodesic(points, 30);
   const positionProperty = new Cesium.SampledPositionProperty();
 
-  for (const point of points) {
+  for (const point of animationPoints) {
     const time = Cesium.JulianDate.fromIso8601(point.time);
     const position = Cesium.Cartesian3.fromDegrees(
       point.lon,
       point.lat,
-      (point.alt || 0)
+      point.alt || 0
     );
     positionProperty.addSample(time, position);
   }
@@ -1216,7 +1658,8 @@ console.log("last time", points[points.length - 1].time);
     polyline: {
       positions: polylinePositions,
       width: 2,
-      material: Cesium.Color.CYAN
+      material: Cesium.Color.CYAN,
+      arcType: Cesium.ArcType.GEODESIC
     }
   });
 
@@ -1228,6 +1671,15 @@ currentBoundingSphere = Cesium.BoundingSphere.fromPoints(polylinePositions);
 
   const start = Cesium.JulianDate.fromIso8601(points[0].time);
   const stop = Cesium.JulianDate.fromIso8601(points[points.length - 1].time);
+  const restoredTime =
+  preserveTime &&
+  Cesium.JulianDate.greaterThanOrEquals(preserveTime, start) &&
+  Cesium.JulianDate.lessThanOrEquals(preserveTime, stop)
+    ? preserveTime
+    : start.clone();
+
+viewer.clock.currentTime = restoredTime;
+
 flightStartJulian = start.clone();
 flightStopJulian = stop.clone();
 inPointJulian = start.clone();
@@ -1236,7 +1688,7 @@ outPointJulian = stop.clone();
 
   viewer.clock.startTime = start.clone();
   viewer.clock.stopTime = stop.clone();
-  viewer.clock.currentTime = preserveTime || start.clone();
+  viewer.clock.currentTime = restoredTime;
   viewer.clock.clockRange = Cesium.ClockRange.CLAMPED;
   viewer.clock.clockStep = Cesium.ClockStep.SYSTEM_CLOCK_MULTIPLIER;
   viewer.clock.multiplier = 100;
@@ -1247,7 +1699,7 @@ if (viewer.timeline) {
 }
 
 
-const modelUri = shouldShowModel() ? getAircraftModelUri(metadata) : null;
+//const modelUri = shouldShowModel() ? getAircraftModelUri(metadata) : null;
 console.log("[model] uri", modelUri);
 
 const velocityOrientation = new Cesium.VelocityOrientationProperty(positionProperty);
@@ -1285,7 +1737,7 @@ const nextTime = Cesium.JulianDate.addSeconds(
     return Cesium.Transforms.headingPitchRollQuaternion(
       position,
       new Cesium.HeadingPitchRoll(
-        heading + Cesium.Math.toRadians(0), // keep your 90° model correction
+        heading + Cesium.Math.toRadians(headingOffsetDeg), // keep your 90° model correction
         0,
         0
       ),
@@ -1298,7 +1750,7 @@ const nextTime = Cesium.JulianDate.addSeconds(
     uri: modelUri,
     minimumPixelSize: 128,
     maximumScale: 100000,
-    scale: 20,
+    scale: effectiveModelScale,
     runAnimations: false,
     //silhouetteColor: Cesium.Color.BLACK,
     //silhouetteSize: 1,
@@ -1312,9 +1764,9 @@ const nextTime = Cesium.JulianDate.addSeconds(
   },
   path: {
     show: true,
-    resolution: 1,
+    resolution: 30,
     leadTime: 0,
-    trailTime: 1e9,
+    trailTime: 1000000,
     width: 3,
     material: Cesium.Color.YELLOW
   },
@@ -1423,6 +1875,14 @@ updateTimelineUI();
       setViewerResolution(w, h);
     });
 
+    document.getElementById("modelSelect").addEventListener("change", async function () {
+      userHasManuallySelectedModel = true;
+      if (currentProjectId && currentFlightId && viewer) {
+        const savedTime = Cesium.JulianDate.clone(viewer.clock.currentTime);
+        await loadCurrentFlight(savedTime);
+      }
+    });
+
     document.getElementById("loadButton").addEventListener("click", async () => {
       await loadCurrentFlight();
     });
@@ -1435,6 +1895,11 @@ updateTimelineUI();
         setStatus(err.message || "Frame export failed.");
       }
     });
+
+    document.getElementById("basemapSelect").addEventListener("change", async function (event) {
+      applyBasemap(event.target.value);
+    });
+
     async function init() {
       try {
 installSidebarToggle();
@@ -1443,11 +1908,16 @@ installTimelineButtons();
 
         await loadProjects();
         await loadFlights(currentProjectId);
+//        await loadAvailableModels();
+        await loadModelConfig();
+        populateModelPicker();
+        await populateModelPicker();
         if (currentProjectId && currentFlightId) {
           await loadCurrentFlight();
         } else {
           setStatus("Choose a flight and click Load Flight.");
         }
+        document.getElementById("basemapSelect").value = currentBasemap;
       } catch (err) {
         console.error(err);
         setStatus(err.message || "Could not initialize viewer.");

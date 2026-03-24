@@ -10,7 +10,8 @@ router.get("/flight-admin/", async (req, res) => {
 
 router.get("/flight-admin/viewer", async (req, res) => {
   res.type("html").send(viewerPage({
-      cesiumToken: process.env.CESIUM_ION_TOKEN || ""
+      cesiumToken: process.env.CESIUM_ION_TOKEN || "",
+      maptilerApiKey: process.env.MAPTILER_API_KEY || ""
     })
   );
 });

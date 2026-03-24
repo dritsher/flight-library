@@ -7,6 +7,8 @@ const sanitizeFilename = require("sanitize-filename");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
 const execFileAsync = promisify(execFile);
+const { loadModelLibrary } = require("../services/modelLibrary");
+const { loadRegistrationLibrary } = require("../services/registrationLibrary");
 
 const {
   PROJECTS_DIR,
@@ -19,7 +21,11 @@ const {
   getProject,
   listProjectFlights,
   getFlightMetadata,
-  saveFlightArtifacts
+  getFlightTrack,
+  dedupeTrackPoints,
+  saveFlightArtifacts,
+  saveUpdatedFlightTrack,
+  deleteFlight
 } = require("../services/storage");
 
 const { parseKmlContent } = require("../services/kmlParser");
@@ -180,6 +186,36 @@ router.get("/flight-api/projects/:projectId/raw/:filename", async (req, res) => 
   }
 });
 
+router.delete("/flight-api/projects/:projectId/flights/:flightId", async (req, res) => {
+  try {
+    const { projectId, flightId } = req.params;
+
+    const project = await getProject(projectId);
+    if (!project) {
+      return res.status(404).json({ error: "Project not found" });
+    }
+
+    const existingMetadata = await getFlightMetadata(projectId, flightId);
+    if (!existingMetadata) {
+      return res.status(404).json({ error: "Flight not found" });
+    }
+
+    const deleted = await deleteFlight(projectId, flightId);
+
+    if (!deleted) {
+      return res.status(404).json({ error: "Flight files not found" });
+    }
+
+    res.json({
+      ok: true,
+      deletedFlightId: flightId
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to delete flight" });
+  }
+});
+
 router.post("/flight-api/projects/:projectId/upload", upload.array("kmlFiles", 20), async (req, res) => {
   try {
     const projectId = req.params.projectId;
@@ -267,6 +303,65 @@ router.post("/flight-api/projects/:projectId/upload", upload.array("kmlFiles", 2
     res.status(500).json({ error: "Failed to upload files" });
   }
 });
+
+router.post("/flight-api/projects/:projectId/flights/:flightId/append", upload.array("kmlFiles", 10), async (req, res) => {
+  try {
+    const { projectId, flightId } = req.params;
+
+    const project = await getProject(projectId);
+    if (!project) {
+      return res.status(404).json({ error: "Project not found" });
+    }
+
+    const existingMetadata = await getFlightMetadata(projectId, flightId);
+    const existingTrack = await getFlightTrack(projectId, flightId);
+
+    if (!existingMetadata || !existingTrack) {
+      return res.status(404).json({ error: "Flight not found" });
+    }
+
+    const files = req.files || [];
+    if (files.length === 0) {
+      return res.status(400).json({ error: "No files uploaded" });
+    }
+
+    const appendedPoints = [];
+
+    for (const file of files) {
+      try {
+        const xmlText = await fsp.readFile(file.path, "utf8");
+        const parsedTrack = parseKmlContent(xmlText);
+        appendedPoints.push(...parsedTrack.points);
+      } finally {
+        await fsp.unlink(file.path).catch(() => {});
+      }
+    }
+
+    const mergedPoints = [...(existingTrack.points || []), ...appendedPoints];
+
+    mergedPoints.sort((a, b) => new Date(a.time) - new Date(b.time));
+
+    const dedupedPoints = dedupeTrackPoints(mergedPoints);
+
+    const updatedMetadata = await saveUpdatedFlightTrack(
+      projectId,
+      flightId,
+      dedupedPoints,
+      existingMetadata
+    );
+
+    res.json({
+      ok: true,
+      flight: updatedMetadata,
+      appendedPoints: appendedPoints.length,
+      totalPoints: dedupedPoints.length
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to append KML to flight" });
+  }
+});
+
 
 router.post("/flight-api/exports/start", async (req, res) => {
   try {
@@ -514,5 +609,25 @@ async function readExportStatus(projectId, flightId, exportId) {
   }
   return JSON.parse(await fsp.readFile(statusPath, "utf8"));
 }
+
+router.get("/flight-api/models", async (req, res) => {
+  try {
+    const models = await loadModelLibrary();
+    res.json({ models });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to load model library" });
+  }
+});
+
+router.get("/flight-api/registrations", async (req, res) => {
+  try {
+    const registrations = await loadRegistrationLibrary();
+    res.json({ registrations });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to load registrations" });
+  }
+});
 
 module.exports = router;
