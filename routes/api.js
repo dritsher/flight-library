@@ -4,9 +4,13 @@ const fsp = require("fs/promises");
 const path = require("path");
 const multer = require("multer");
 const sanitizeFilename = require("sanitize-filename");
+const { execFile } = require("child_process");
+const { promisify } = require("util");
+const execFileAsync = promisify(execFile);
 
 const {
   PROJECTS_DIR,
+  EXPORTS_DIR,
   TEMP_DIR,
   slugify,
   ensureDir,
@@ -263,5 +267,252 @@ router.post("/flight-api/projects/:projectId/upload", upload.array("kmlFiles", 2
     res.status(500).json({ error: "Failed to upload files" });
   }
 });
+
+router.post("/flight-api/exports/start", async (req, res) => {
+  try {
+    const { projectId, flightId, fps } = req.body || {};
+    if (!projectId || !flightId) {
+      return res.status(400).json({ error: "projectId and flightId are required" });
+    }
+
+    const exportId = "export-" + Date.now();
+    const exportDir = path.join(EXPORTS_DIR, projectId, flightId, exportId);
+    await ensureDir(exportDir);
+
+    const metadata = {
+      exportId,
+      projectId,
+      flightId,
+      fps: Number(fps || 30),
+      createdAt: new Date().toISOString()
+    };
+
+    await fsp.writeFile(
+      path.join(exportDir, "export.json"),
+      JSON.stringify(metadata, null, 2),
+      "utf8"
+    );
+
+    await writeExportStatus(projectId, flightId, exportId, {
+      exportId,
+      projectId,
+      flightId,
+      state: "collecting_frames",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      framesUploaded: 0,
+      movieUrl: null,
+      error: null
+    });
+
+    res.status(201).json({
+      exportId,
+      uploadUrlBase: "/flight-api/exports/" + encodeURIComponent(exportId),
+      exportDir
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to start export" });
+  }
+});
+
+router.post("/flight-api/exports/:exportId/frame", async (req, res) => {
+  try {
+    const { exportId } = req.params;
+    const { projectId, flightId, filename, imageBase64, utcTime, frame } = req.body || {};
+
+    if (!projectId || !flightId || !filename || !imageBase64) {
+      return res.status(400).json({ error: "Missing required frame fields" });
+    }
+
+    const exportDir = path.join(EXPORTS_DIR, projectId, flightId, exportId);
+    await ensureDir(exportDir);
+
+    const buffer = Buffer.from(imageBase64, "base64");
+    await fsp.writeFile(path.join(exportDir, filename), buffer);
+
+    const manifestPath = path.join(exportDir, "frames.json");
+    let manifest = [];
+    if (fs.existsSync(manifestPath)) {
+      manifest = JSON.parse(await fsp.readFile(manifestPath, "utf8"));
+    }
+
+    manifest.push({ frame, filename, utcTime });
+
+    await fsp.writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+
+    await writeExportStatus(projectId, flightId, exportId, {
+      exportId,
+      projectId,
+      flightId,
+      state: "collecting_frames",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      framesUploaded: manifest.length,
+      movieUrl: null,
+      error: null
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to save frame" });
+  }
+});
+
+router.post("/flight-api/exports/:exportId/finish", async (req, res) => {
+  try {
+    const { exportId } = req.params;
+    const { projectId, flightId, fps } = req.body || {};
+
+    if (!projectId || !flightId) {
+      return res.status(400).json({ error: "projectId and flightId are required" });
+    }
+
+    const exportDir = getExportDir(projectId, flightId, exportId);
+    const outputPath = path.join(exportDir, "output.mp4");
+    const movieUrl =
+      "/exports/" +
+      encodeURIComponent(projectId) + "/" +
+      encodeURIComponent(flightId) + "/" +
+      encodeURIComponent(exportId) + "/output.mp4";
+
+    await writeExportStatus(projectId, flightId, exportId, {
+      exportId,
+      projectId,
+      flightId,
+      state: "encoding",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      framesUploaded: 0,
+      movieUrl: null,
+      error: null
+    });
+
+    const ffmpeg = execFile("ffmpeg", [
+      "-y",
+      "-framerate", String(Number(fps || 30)),
+      "-i", path.join(exportDir, "frame_%04d.png"),
+      "-c:v", "libx264",
+      "-pix_fmt", "yuv420p",
+      "-crf", "20",
+      "-preset", "veryfast",
+      outputPath
+    ], async (err) => {
+      if (err) {
+        console.error("ffmpeg failed", err);
+        try {
+          await writeExportStatus(projectId, flightId, exportId, {
+            exportId,
+            projectId,
+            flightId,
+            state: "failed",
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            framesUploaded: 0,
+            movieUrl: null,
+            error: err.message || "ffmpeg failed"
+          });
+        } catch (writeErr) {
+          console.error("Could not write failed status", writeErr);
+        }
+        return;
+      }
+
+      try {
+        await writeExportStatus(projectId, flightId, exportId, {
+          exportId,
+          projectId,
+          flightId,
+          state: "done",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          framesUploaded: 0,
+          movieUrl,
+          error: null
+        });
+      } catch (writeErr) {
+        console.error("Could not write done status", writeErr);
+      }
+    });
+
+    ffmpeg.on("error", async (err) => {
+      console.error("ffmpeg spawn error", err);
+      try {
+        await writeExportStatus(projectId, flightId, exportId, {
+          exportId,
+          projectId,
+          flightId,
+          state: "failed",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          framesUploaded: 0,
+          movieUrl: null,
+          error: err.message || "ffmpeg spawn error"
+        });
+      } catch (writeErr) {
+        console.error("Could not write spawn-error status", writeErr);
+      }
+    });
+
+    res.json({
+      ok: true,
+      state: "encoding",
+      exportId
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to start movie build" });
+  }
+});
+
+router.get("/flight-api/exports/:exportId/status", async (req, res) => {
+  try {
+    const { exportId } = req.params;
+    const { projectId, flightId } = req.query || {};
+
+    if (!projectId || !flightId) {
+      return res.status(400).json({ error: "projectId and flightId are required" });
+    }
+
+    const status = await readExportStatus(projectId, flightId, exportId);
+
+    if (!status) {
+      return res.status(404).json({ error: "Export status not found" });
+    }
+
+    res.json(status);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to read export status" });
+  }
+});
+
+
+function getExportDir(projectId, flightId, exportId) {
+  return path.join(EXPORTS_DIR, projectId, flightId, exportId);
+}
+
+function getStatusPath(projectId, flightId, exportId) {
+  return path.join(getExportDir(projectId, flightId, exportId), "status.json");
+}
+
+async function writeExportStatus(projectId, flightId, exportId, status) {
+  const exportDir = getExportDir(projectId, flightId, exportId);
+  await ensureDir(exportDir);
+  await fsp.writeFile(
+    getStatusPath(projectId, flightId, exportId),
+    JSON.stringify(status, null, 2),
+    "utf8"
+  );
+}
+
+async function readExportStatus(projectId, flightId, exportId) {
+  const statusPath = getStatusPath(projectId, flightId, exportId);
+  if (!fs.existsSync(statusPath)) {
+    return null;
+  }
+  return JSON.parse(await fsp.readFile(statusPath, "utf8"));
+}
 
 module.exports = router;

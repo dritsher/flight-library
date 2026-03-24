@@ -4,6 +4,7 @@ const path = require("path");
 
 const ROOT = "/opt/flight-library";
 const PROJECTS_DIR = path.join(ROOT, "projects");
+const EXPORTS_DIR = path.join(ROOT, "exports");
 const TEMP_DIR = path.join(ROOT, "app", "temp");
 
 function slugify(input) {
@@ -165,6 +166,7 @@ async function saveFlightArtifacts(projectId, originalFilename, parsedTrack) {
 module.exports = {
   ROOT,
   PROJECTS_DIR,
+  EXPORTS_DIR,
   TEMP_DIR,
   slugify,
   ensureDir,

@@ -196,6 +196,42 @@ html, body {
   <option value="100" selected>100x</option>
   <option value="200">200x</option>
 </select>
+<label for="resolutionSelect">Resolution</label>
+<h3>Export</h3>
+
+<label for="exportFps">Export FPS</label>
+<select id="exportFps">
+  <option value="24">24</option>
+  <option value="30" selected>30</option>
+  <option value="60">60</option>
+</select>
+<label for="exportSpeedSelect">Export Speed</label>
+<select id="exportSpeedSelect">
+  <option value="1">1x</option>
+  <option value="10">10x</option>
+  <option value="100" selected>100x</option>
+  <option value="1000">1000x</option>
+</select>
+<select id="resolutionSelect">
+  <option value="1280x720">720p</option>
+  <option value="1920x1080" selected>1080p Landscape</option>
+  <option value="1080x1920" selected>1080p Vertical</option>
+  <option value="3840x2160">4K</option>
+</select>
+<div id="exportProgressWrap" style="margin-top:12px;">
+  <div style="font-size:13px; margin-bottom:6px;">
+    <strong>Export Progress:</strong>
+    <span id="exportProgressLabel">Idle</span>
+  </div>
+  <div style="width:100%; height:14px; background:#ddd; border-radius:999px; overflow:hidden;">
+    <div
+      id="exportProgressBar"
+      style="width:0%; height:100%; background:#2d7ef7; transition:width 0.15s ease;"
+    ></div>
+  </div>
+</div>
+<button id="exportFramesButton" type="button">Export In/Out Frames</button>
+<button id="captureFrame">Capture Frame</button>
 <h3>Timeline</h3>
 
 <div id="timelinePanel">
@@ -264,7 +300,124 @@ document.getElementById("showModel").addEventListener("change", async function (
   }
 });
 
+document.getElementById("captureFrame").addEventListener("click", function () {
+  viewer.scene.requestRender();
+  viewer.render();
+
+  const canvas = viewer.scene.canvas;
+  const dataUrl = canvas.toDataURL("image/png");
+
+  const link = document.createElement("a");
+  link.href = dataUrl;
+  link.download = "frame.png";
+  link.click();
+});
+
+///////////////////////////
 //// HELPER FUNCTIONS /////
+///////////////////////////
+
+
+function setExportProgress(current, total) {
+  const label = document.getElementById("exportProgressLabel");
+  const bar = document.getElementById("exportProgressBar");
+
+  if (!label || !bar) return;
+
+  if (!total || total <= 0) {
+    label.textContent = "Idle";
+    bar.style.width = "0%";
+    return;
+  }
+
+  const percent = Math.max(0, Math.min(100, (current / total) * 100));
+  console.log("[progress]", current, total);
+
+  label.textContent = current + " / " + total + " (" + percent.toFixed(1) + "%)";
+  bar.style.width = percent + "%";
+}
+
+function setExportProgressMessage(text) {
+  const label = document.getElementById("exportProgressLabel");
+  if (label) {
+    label.textContent = text;
+  }
+}
+
+function resetExportProgress() {
+  const bar = document.getElementById("exportProgressBar");
+  const label = document.getElementById("exportProgressLabel");
+
+  if (bar) {
+    bar.style.width = "0%";
+  }
+  if (label) {
+    label.textContent = "Idle";
+  }
+}
+
+function getExportSpeed() {
+  return Number(document.getElementById("exportSpeedSelect").value || 1);
+}
+
+function getSelectedResolution() {
+  const value = document.getElementById("resolutionSelect").value;
+  const [width, height] = value.split("x").map(Number);
+  return { width, height };
+}
+
+function getExportFps() {
+  return Number(document.getElementById("exportFps").value || 30);
+}
+
+function padFrameNumber(n) {
+  return String(n).padStart(4, "0");
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  setTimeout(function () {
+    URL.revokeObjectURL(url);
+  }, 1000);
+}
+
+function dataUrlToBlob(dataUrl) {
+  const parts = dataUrl.split(",");
+  const mimeMatch = parts[0].match(/:(.*?);/);
+  const mime = mimeMatch ? mimeMatch[1] : "image/png";
+  const binary = atob(parts[1]);
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+
+  for (let i = 0; i < len; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+
+  return new Blob([bytes], { type: mime });
+}
+
+function sleep(ms) {
+  return new Promise(function (resolve) {
+    setTimeout(resolve, ms);
+  });
+}
+
+function setViewerResolution(width, height) {
+  const pane = document.getElementById("cesiumPane");
+  pane.style.width = width + "px";
+  pane.style.height = height + "px";
+
+  if (viewer) {
+    viewer.resize();
+    viewer.scene.requestRender();
+  }
+}
+
+
     function setStatus(text) {
       document.getElementById("status").textContent = text;
     }
@@ -421,7 +574,284 @@ function installSidebarToggle() {
   });
 }
 
+// --------------------
+// Export / Movie
+// --------------------
 
+async function exportFrames() {
+  const start = inPointJulian;
+  const end = outPointJulian;
+
+  const [w, h] = document
+    .getElementById("resolutionSelect")
+    .value
+    .split("x")
+    .map(Number);
+
+  setViewerResolution(w, h);
+  viewer.resolutionScale = 2.0;
+  viewer.render();
+
+  let time = Cesium.JulianDate.clone(start);
+
+  while (Cesium.JulianDate.lessThanOrEquals(time, end)) {
+    viewer.clock.currentTime = time;
+    viewer.scene.render();
+
+    const dataUrl = viewer.scene.canvas.toDataURL("image/png");
+
+    // save or send to server
+    console.log("frame", dataUrl.substring(0, 50));
+
+    time = Cesium.JulianDate.addSeconds(time, 1, new Cesium.JulianDate());
+  }
+}
+
+async function startServerExport() {
+  const fps = getExportFps();
+
+  const res = await fetch("/flight-api/exports/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      projectId: currentProjectId,
+      flightId: currentFlightId,
+      fps
+    })
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || "Could not start export");
+  }
+
+  return data;
+}
+
+async function uploadFrameToServer(exportId, frameIndex, utcTime, dataUrl) {
+  const imageBase64 = dataUrl.split(",")[1];
+  const filename = "frame_" + padFrameNumber(frameIndex) + ".png";
+
+  const res = await fetch("/flight-api/exports/" + encodeURIComponent(exportId) + "/frame", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      projectId: currentProjectId,
+      flightId: currentFlightId,
+      frame: frameIndex,
+      filename,
+      utcTime,
+      imageBase64
+    })
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || "Failed to upload frame");
+  }
+}
+
+async function finishServerExport(exportId) {
+  const fps = getExportFps();
+
+  const res = await fetch("/flight-api/exports/" + encodeURIComponent(exportId) + "/finish", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      projectId: currentProjectId,
+      flightId: currentFlightId,
+      fps
+    })
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || "Failed to start movie build");
+  }
+
+  return data;
+}
+
+
+async function exportFramesFromRange() {
+  if (!viewer || !inPointJulian || !outPointJulian) {
+    setStatus("Set In and Out points first.");
+    return;
+  }
+
+  const fps = getExportFps();
+  const exportSpeed = getExportSpeed();
+  const frameStepSeconds = exportSpeed / fps;
+  const { width, height } = getSelectedResolution();
+  const totalSeconds = Cesium.JulianDate.secondsDifference(outPointJulian, inPointJulian);
+  const totalFrames = Math.floor(totalSeconds / frameStepSeconds) + 1;
+
+  const savedTime = Cesium.JulianDate.clone(viewer.clock.currentTime);
+  const savedShouldAnimate = viewer.clock.shouldAnimate;
+
+  resetExportProgress();
+  setStatus("Starting export...");
+  viewer.clock.shouldAnimate = false;
+console.log("[export] loop start");
+
+  const exportSession = await startServerExport();
+
+  setViewerResolution(width, height);
+  await sleep(100);
+
+  let frameIndex = 1;
+  let time = Cesium.JulianDate.clone(inPointJulian);
+
+  while (Cesium.JulianDate.lessThanOrEquals(time, outPointJulian)) {
+    viewer.clock.currentTime = Cesium.JulianDate.clone(time);
+    viewer.scene.requestRender();
+    viewer.render();
+
+    await sleep(50);
+
+    const dataUrl = viewer.scene.canvas.toDataURL("image/png");
+    await uploadFrameToServer(
+      exportSession.exportId,
+      frameIndex,
+      Cesium.JulianDate.toIso8601(time),
+      dataUrl
+    );
+
+    setStatus("Uploaded frame " + frameIndex + "...");
+    frameIndex += 1;
+console.log("[export] frame", frameIndex);
+setExportProgress(frameIndex, totalFrames);
+
+    time = Cesium.JulianDate.addSeconds(
+      time,
+      frameStepSeconds,
+      new Cesium.JulianDate()
+    );
+  }
+
+  await finishServerExport(exportSession.exportId);
+
+  setExportProgressMessage("Encoding movie...");
+  setStatus("Encoding movie...");
+
+  const finished = await pollExportStatus(exportSession.exportId);
+
+  viewer.clock.currentTime = savedTime;
+  viewer.clock.shouldAnimate = savedShouldAnimate;
+  viewer.scene.requestRender();
+
+  setExportProgress(totalFrames, totalFrames);
+  setExportProgressMessage("Done");
+  setStatus("Movie ready: " + finished.movieUrl);
+
+  window.open(finished.movieUrl, "_blank");
+}
+
+async function pollExportStatus(exportId) {
+  while (true) {
+    const url =
+      "/flight-api/exports/" +
+      encodeURIComponent(exportId) +
+      "/status?projectId=" +
+      encodeURIComponent(currentProjectId) +
+      "&flightId=" +
+      encodeURIComponent(currentFlightId);
+
+    const res = await fetch(url);
+    const data = await res.json();
+
+    if (!res.ok) {
+      throw new Error(data.error || "Failed to poll export status");
+    }
+
+    if (data.state === "done") {
+      return data;
+    }
+
+    if (data.state === "failed") {
+      throw new Error(data.error || "Movie export failed");
+    }
+
+    setExportProgressMessage(
+      data.state === "encoding"
+        ? "Encoding movie..."
+        : "Preparing export..."
+    );
+
+    await sleep(1000);
+  }
+}
+
+
+/*
+async function exportFramesFromRange() {
+  if (!viewer || !inPointJulian || !outPointJulian) {
+    setStatus("Set In and Out points first.");
+    return;
+  }
+
+  const fps = getExportFps();
+  const exportSpeed = getExportSpeed();
+  const frameStepSeconds = exportSpeed / fps;
+  const { width, height } = getSelectedResolution();
+
+  const savedTime = Cesium.JulianDate.clone(viewer.clock.currentTime);
+  const savedShouldAnimate = viewer.clock.shouldAnimate;
+
+  setStatus("Preparing export...");
+  viewer.clock.shouldAnimate = false;
+
+  setViewerResolution(width, height);
+  await sleep(100);
+
+  const manifest = [];
+  let frameIndex = 1;
+  let time = Cesium.JulianDate.clone(inPointJulian);
+
+  while (Cesium.JulianDate.lessThanOrEquals(time, outPointJulian)) {
+    viewer.clock.currentTime = Cesium.JulianDate.clone(time);
+    viewer.scene.requestRender();
+    viewer.render();
+
+    await sleep(50);
+
+    const dataUrl = viewer.scene.canvas.toDataURL("image/png");
+    const blob = dataUrlToBlob(dataUrl);
+    const filename = "frame_" + padFrameNumber(frameIndex) + ".png";
+
+    downloadBlob(blob, filename);
+
+    manifest.push({
+      frame: frameIndex,
+      filename: filename,
+      utcTime: Cesium.JulianDate.toIso8601(time)
+    });
+
+    frameIndex += 1;
+    time = Cesium.JulianDate.addSeconds(
+      time,
+      frameStepSeconds,
+      new Cesium.JulianDate()
+    );
+  }
+
+  const manifestBlob = new Blob(
+    [JSON.stringify(manifest, null, 2)],
+    { type: "application/json" }
+  );
+  downloadBlob(manifestBlob, "frames_manifest.json");
+
+  viewer.clock.currentTime = savedTime;
+  viewer.clock.shouldAnimate = savedShouldAnimate;
+  viewer.scene.requestRender();
+
+  setStatus("Exported " + manifest.length + " frame(s).");
+}
+*/
+
+// --------------------
+// Camera Views
+// --------------------
 
 function setOverviewCamera() {
   if (!viewer || !currentBoundingSphere) {
@@ -662,7 +1092,12 @@ viewer = new Cesium.Viewer("cesiumContainer", {
   sceneModePicker: false,
   navigationHelpButton: false,
   fullscreenButton: false,
-  terrainProvider: new Cesium.EllipsoidTerrainProvider()
+  terrainProvider: new Cesium.EllipsoidTerrainProvider(),
+  contextOptions: {
+    webgl: {
+      preserveDrawingBuffer: true
+    }
+  }
 });
 
 //    viewer.scene.requestRenderMode = false;
@@ -983,10 +1418,23 @@ updateTimelineUI();
       }
     });
 
+    document.getElementById("resolutionSelect").addEventListener("change", function (e) {
+      const [w, h] = e.target.value.split("x").map(Number);
+      setViewerResolution(w, h);
+    });
+
     document.getElementById("loadButton").addEventListener("click", async () => {
       await loadCurrentFlight();
     });
 
+    document.getElementById("exportFramesButton").addEventListener("click", async function () {
+      try {
+        await exportFramesFromRange();
+      } catch (err) {
+        console.error(err);
+        setStatus(err.message || "Frame export failed.");
+      }
+    });
     async function init() {
       try {
 installSidebarToggle();
