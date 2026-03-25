@@ -1,3 +1,4 @@
+
 function viewerPage({ cesiumToken = "", maptilerApiKey = "" } = {}) {
   return `<!doctype html>
 <html lang="en">
@@ -181,6 +182,10 @@ html, body {
   <input type="checkbox" id="showTrackLine" checked>
   Show blue track line
 </label>
+<label>
+  <input type="checkbox" id="showTrailLine" checked>
+  Show yellow trail line
+</label>
 <select id="modelSelect">
   <option value="">Auto</option>
 </select>
@@ -190,7 +195,8 @@ html, body {
   <option value="follow">Follow</option>
   <option value="chase">Chase</option>
   <option value="lead">Lead</option>
-  <option value="side">Side</option>
+  <option value="side">Left Side</option>
+  <option value="rightside">Right Side</option>
   <option value="tail">Tail</option>
 </select>
 
@@ -295,7 +301,7 @@ let flightStopJulian = null;
 let inPointJulian = null;
 let outPointJulian = null;
 
-let currentTrackEntity = null;
+let trackEntity = null;
 let userHasManuallySelectedModel = false;
 
 let availableModels = [];
@@ -1270,7 +1276,7 @@ function setLeadCamera() {
   viewer.scene.preRender.addEventListener(followHandler);
 }
 
-function setSideCamera() {
+function setSideCamera(sideFactor) {
   if (!viewer || !currentEntity) {
     return;
   }
@@ -1290,8 +1296,8 @@ function setSideCamera() {
     const rotation = Cesium.Matrix3.fromQuaternion(orientation);
     const bodyTransform = Cesium.Matrix4.fromRotationTranslation(rotation, position);
 
-    // +Y = one side of aircraft body frame. Use -250 for the opposite side.
-    const offset = new Cesium.Cartesian3(-23, 50, 12);
+    // +Y = one side of aircraft body frame. Use -50 for the opposite side.
+    const offset = new Cesium.Cartesian3(-23, 50*sideFactor, 12);
 
     const cameraPosition = Cesium.Matrix4.multiplyByPoint(
       bodyTransform,
@@ -1404,7 +1410,9 @@ function applyCameraMode() {
   } else if (cameraMode === "lead") {
     setLeadCamera();
   } else if (cameraMode === "side") {
-    setSideCamera();
+    setSideCamera(1);
+  } else if (cameraMode === "rightside") {
+    setSideCamera(-1);
   } else if (cameraMode === "tail") {
     setTailCamera();
   } else {
@@ -1605,7 +1613,7 @@ console.log("[renderFlight] start", {
   viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
 
   viewer.entities.removeAll();
-  currentTrackEntity = null;
+  TrackEntity = null;
   viewer.trackedEntity = undefined;
 
 console.log("[renderFlight] after cleanup", {
@@ -1658,11 +1666,10 @@ console.log("last time", points[points.length - 1].time);
     polyline: {
       positions: polylinePositions,
       width: 2,
-      material: Cesium.Color.CYAN,
-      arcType: Cesium.ArcType.GEODESIC
+      material: Cesium.Color.CYAN
     }
   });
-
+ 
 const showTrackCheckbox = document.getElementById("showTrackLine");
 currentTrackEntity.show = !showTrackCheckbox || showTrackCheckbox.checked;
 
@@ -1778,6 +1785,11 @@ console.log("[model] graphics", entity.model);
 
 currentEntity = entity;
 
+const toggle = document.getElementById("showTrailLine");
+if (currentEntity && currentEntity.path && toggle) {
+  currentEntity.path.show = toggle.checked;
+}
+
 if (viewer.__dotLogger) {
   viewer.scene.postRender.removeEventListener(viewer.__dotLogger);
   viewer.__dotLogger = null;
@@ -1870,6 +1882,11 @@ updateTimelineUI();
       }
     });
 
+    const toggle = document.getElementById("showTrailLine");
+     if (trackEntity && toggle) {
+      trackEntity.show = toggle.checked;
+    }
+
     document.getElementById("resolutionSelect").addEventListener("change", function (e) {
       const [w, h] = e.target.value.split("x").map(Number);
       setViewerResolution(w, h);
@@ -1880,6 +1897,12 @@ updateTimelineUI();
       if (currentProjectId && currentFlightId && viewer) {
         const savedTime = Cesium.JulianDate.clone(viewer.clock.currentTime);
         await loadCurrentFlight(savedTime);
+      }
+    });
+
+    document.getElementById("showTrailLine").addEventListener("change", function (e) {
+      if (currentEntity && currentEntity.path) {
+        currentEntity.path.show = e.target.checked;
       }
     });
 
