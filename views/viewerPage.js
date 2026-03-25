@@ -332,6 +332,9 @@ let currentAttitude = {
 };
 let smoothedCameraHeadingDeg = null;
 let smoothedGroundHeadingDeg = null;
+let isRenderingFlight = false;
+
+const SIGNAL_GAP_THRESHOLD_SECONDS = 90;
 const lowAltitudeThresholdM = 120;
 const minClearanceM = 4;
 const MAPTILER_API_KEY = ${JSON.stringify(maptilerApiKey)};
@@ -375,6 +378,18 @@ document.getElementById("captureFrame").addEventListener("click", function () {
 ///////////////////////////
 //// HELPER FUNCTIONS /////
 ///////////////////////////
+
+function computeTimeGapSeconds(a, b) {
+  if (!a || !b || !a.time || !b.time) {
+    return Infinity;
+  }
+
+  const t1 = new Date(a.time).getTime();
+  const t2 = new Date(b.time).getTime();
+  const dtSeconds = (t2 - t1) / 1000;
+
+  return Number.isFinite(dtSeconds) ? dtSeconds : Infinity;
+}
 
 function getGroundHeadingAlpha(speedMps) {
   if (!Number.isFinite(speedMps)) return 0.08;
@@ -579,6 +594,7 @@ async function updateFlightDashboard() {
   const prevPoint = idx > 0 ? currentTrackPoints[idx - 1] : null;
   const nextPoint = currentTrackPoints[Math.min(idx + 2, currentTrackPoints.length - 1)];
 
+
   const speedMps = computeSpeedMetersPerSecond(a, b);
   const verticalSpeedMps = computeVerticalSpeedMetersPerSecond(a, b);
   const headingDeg = computeHeadingDegrees(a, b);
@@ -616,11 +632,21 @@ async function updateFlightDashboard() {
     rollDeg
   });
 
+  const gapSeconds = computeTimeGapSeconds(a, b);
+  const signalMissing = gapSeconds > SIGNAL_GAP_THRESHOLD_SECONDS;
+
+  let statusText = "Airborne";
+  if (signalMissing) {
+    statusText = "ADS-B Signal lost";
+  } else if (landed) {
+    statusText = "Landed";
+  }
+
   updateDashboard({
     speedMps,
     headingDeg,
     altitudeM,
-    statusText: landed ? "Landed" : "Airborne"
+    statusText
   });
 }
 
@@ -1668,72 +1694,83 @@ function setSideCamera(sideFactor) {
   }
 
   removeFollowMode();
+
   smoothedCameraHeadingDeg = null;
 
   followHandler = function () {
+    if (isRenderingFlight) {
+       return;
+    }
+
     const position = currentEntity.position.getValue(viewer.clock.currentTime);
     if (!position) {
       return;
     }
 
-const now = viewer.clock.currentTime;
-const nowIso = Cesium.JulianDate.toIso8601(now);
-const nowMs = new Date(nowIso).getTime();
+    if (!Array.isArray(currentTrackPoints) || currentTrackPoints.length < 2) {
+      return;
+    }
 
-if (!Array.isArray(currentTrackPoints) || currentTrackPoints.length < 2) {
-  return;
-}
+    const now = viewer.clock.currentTime;
+    const nowIso = Cesium.JulianDate.toIso8601(now);
+    const nowMs = new Date(nowIso).getTime();
 
-let idx = -1;
-for (let i = 0; i < currentTrackPoints.length - 1; i += 1) {
-  const t1 = new Date(currentTrackPoints[i].time).getTime();
-  const t2 = new Date(currentTrackPoints[i + 1].time).getTime();
+    let idx = -1;
+    for (let i = 0; i < currentTrackPoints.length - 1; i += 1) {
+      const p1 = currentTrackPoints[i];
+      const p2 = currentTrackPoints[i + 1];
 
-  if (nowMs >= t1 && nowMs <= t2) {
-    idx = i;
-    break;
-  }
-}
+      if (!p1 || !p2 || !p1.time || !p2.time) {
+        continue;
+      }
 
-if (idx < 0) {
-  if (nowMs < new Date(currentTrackPoints[0].time).getTime()) {
-    idx = 0;
-  } else {
-    idx = currentTrackPoints.length - 2;
-  }
-}
+      const t1 = new Date(p1.time).getTime();
+      const t2 = new Date(p2.time).getTime();
 
-const a = currentTrackPoints[idx];
-const b = currentTrackPoints[idx + 1];
+      if (nowMs >= t1 && nowMs <= t2) {
+        idx = i;
+        break;
+      }
+    }
 
-if (!a || !b) {
-  return;
-}
+    if (idx < 0) {
+      const first = currentTrackPoints[0];
+      const lastUsableIndex = currentTrackPoints.length - 2;
+      const firstTime = first && first.time ? new Date(first.time).getTime() : NaN;
+
+      if (Number.isFinite(firstTime) && nowMs < firstTime) {
+        idx = 0;
+      } else {
+        idx = Math.max(0, lastUsableIndex);
+      }
+    }
+
+    const a = currentTrackPoints[idx];
+    const b = currentTrackPoints[idx + 1];
+    const prev = idx > 0 ? currentTrackPoints[idx - 1] : null;
+
+    if (!a || !b || !a.time || !b.time) {
+      return;
+    }
 
     const rawHeadingDeg = computeHeadingDegrees(a, b);
 
-const headingToUse =
-  (rawHeadingDeg === 0 && Number.isFinite(smoothedCameraHeadingDeg))
-    ? smoothedCameraHeadingDeg
-    : rawHeadingDeg;
+    const headingToUse =
+      (rawHeadingDeg === 0 && Number.isFinite(smoothedCameraHeadingDeg))
+        ? smoothedCameraHeadingDeg
+        : rawHeadingDeg;
 
-const grounded = isGroundedPoint(
-  idx > 0 ? currentTrackPoints[idx - 1] : null,
-  a,
-  b
-);
+    const grounded = isGroundedPoint(prev, a, b);
+    const headingAlpha = grounded ? 0.12 : 0.2;
 
-const headingAlpha = grounded ? 0.05 : 0.2;
-
-smoothedCameraHeadingDeg = smoothHeadingDegrees(
-  smoothedCameraHeadingDeg,
-  headingToUse,
-  headingAlpha
-);
+    smoothedCameraHeadingDeg = smoothHeadingDegrees(
+      smoothedCameraHeadingDeg,
+      headingToUse,
+      headingAlpha
+    );
 
     const transform = getHeadingOnlyTransform(position, smoothedCameraHeadingDeg);
 
-    // +Y = one side of aircraft body frame. Use -50 for the opposite side.
     const offset = new Cesium.Cartesian3(-50*sideFactor, -23, 12);
 
     const cameraPosition = Cesium.Matrix4.multiplyByPoint(
@@ -1749,6 +1786,7 @@ smoothedCameraHeadingDeg = smoothHeadingDegrees(
 }
 
 
+
 function setTailCamera() {
   if (!viewer || !currentEntity || !currentTrackPoints || currentTrackPoints.length < 2) {
     return;
@@ -1759,6 +1797,10 @@ function setTailCamera() {
   smoothedCameraHeadingDeg = null;
 
   followHandler = function () {
+    if (isRenderingFlight) {
+      return;
+    }
+
     const position = currentEntity.position.getValue(viewer.clock.currentTime);
     if (!position) {
       return;
@@ -1981,6 +2023,17 @@ viewer = new Cesium.Viewer("cesiumContainer", {
   }
 });
 
+// --- Tile pop smoothing / visual polish ---
+
+viewer.scene.fog.enabled = true;
+viewer.scene.fog.density = 0.0002;
+viewer.scene.fog.minimumBrightness = 0.85;
+
+viewer.scene.globe.maximumScreenSpaceError = 2;
+
+viewer.scene.globe.preloadSiblings = true;
+viewer.scene.globe.preloadAncestors = true;
+
 setTimeout(async function () {
   await applyBasemap(currentBasemap);
 }, 0);
@@ -2026,6 +2079,7 @@ setTimeout(function () {
 
 async function renderFlight(projectId, flightId, preserveTime) {
   setStatus("Loading flight...");
+  isRenderingFlight = true;
 
   const metadata = await loadFlightMetadata(projectId, flightId);
   const track = await loadTrack(projectId, flightId);
@@ -2361,6 +2415,7 @@ setTimeout(function () {
 applyCameraMode();
 updateTimelineUI();
 
+  isRenderingFlight = false;
   setStatus("Loaded.");
 }
 
