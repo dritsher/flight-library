@@ -333,7 +333,7 @@ let currentAttitude = {
 let smoothedCameraHeadingDeg = null;
 let smoothedGroundHeadingDeg = null;
 const lowAltitudeThresholdM = 120;
-const minClearanceM = 3;
+const minClearanceM = 4;
 const MAPTILER_API_KEY = ${JSON.stringify(maptilerApiKey)};
 
 document.getElementById("cameraMode").addEventListener("change", async function (event) {
@@ -376,7 +376,13 @@ document.getElementById("captureFrame").addEventListener("click", function () {
 //// HELPER FUNCTIONS /////
 ///////////////////////////
 
-
+function getGroundHeadingAlpha(speedMps) {
+  if (!Number.isFinite(speedMps)) return 0.08;
+  if (speedMps < 5) return 0.03;
+  if (speedMps < 15) return 0.05;
+  if (speedMps < 40) return 0.08;
+  return 0.12;
+}
 
 function smoothHeadingDegrees(previousDeg, nextDeg, alpha = 0.15) {
   if (!Number.isFinite(previousDeg)) {
@@ -719,7 +725,7 @@ function computeApproxRollDegrees(prevPoint, point, nextPoint) {
   const turnRateDegPerSec = deltaHeading / dtSeconds;
 
   // Tweak this factor by eye
-  let roll = turnRateDegPerSec * 18;
+  let roll = turnRateDegPerSec * 16;
 
   // Clamp so it doesn't go crazy
   roll = Math.max(-30, Math.min(30, roll));
@@ -1743,13 +1749,13 @@ smoothedCameraHeadingDeg = smoothHeadingDegrees(
 }
 
 
-
 function setTailCamera() {
   if (!viewer || !currentEntity || !currentTrackPoints || currentTrackPoints.length < 2) {
     return;
   }
 
   removeFollowMode();
+
   smoothedCameraHeadingDeg = null;
 
   followHandler = function () {
@@ -1759,62 +1765,57 @@ function setTailCamera() {
     }
 
     const now = viewer.clock.currentTime;
-const nowIso = Cesium.JulianDate.toIso8601(now);
-const nowMs = new Date(nowIso).getTime();
+    const nowIso = Cesium.JulianDate.toIso8601(now);
+    const nowMs = new Date(nowIso).getTime();
 
-if (!Array.isArray(currentTrackPoints) || currentTrackPoints.length < 2) {
-  return;
-}
+    let idx = -1;
+    for (let i = 0; i < currentTrackPoints.length - 1; i += 1) {
+      const t1 = new Date(currentTrackPoints[i].time).getTime();
+      const t2 = new Date(currentTrackPoints[i + 1].time).getTime();
 
-let idx = -1;
-for (let i = 0; i < currentTrackPoints.length - 1; i += 1) {
-  const t1 = new Date(currentTrackPoints[i].time).getTime();
-  const t2 = new Date(currentTrackPoints[i + 1].time).getTime();
+      if (nowMs >= t1 && nowMs <= t2) {
+        idx = i;
+        break;
+      }
+    }
 
-  if (nowMs >= t1 && nowMs <= t2) {
-    idx = i;
-    break;
-  }
-}
+    if (idx < 0) {
+      if (nowMs < new Date(currentTrackPoints[0].time).getTime()) {
+        idx = 0;
+      } else {
+        idx = currentTrackPoints.length - 2;
+      }
+    }
 
-if (idx < 0) {
-  if (nowMs < new Date(currentTrackPoints[0].time).getTime()) {
-    idx = 0;
-  } else {
-    idx = currentTrackPoints.length - 2;
-  }
-}
+    const a = currentTrackPoints[idx];
+    const b = currentTrackPoints[idx + 1];
 
-const a = currentTrackPoints[idx];
-const b = currentTrackPoints[idx + 1];
-
-if (!a || !b) {
-  return;
-}
+    if (!a || !b) {
+      return;
+    }
 
     const rawHeadingDeg = computeHeadingDegrees(a, b);
 
-const headingToUse =
-  (rawHeadingDeg === 0 && Number.isFinite(smoothedCameraHeadingDeg))
-    ? smoothedCameraHeadingDeg
-    : rawHeadingDeg;
+    const headingToUse =
+      (rawHeadingDeg === 0 && Number.isFinite(smoothedCameraHeadingDeg))
+        ? smoothedCameraHeadingDeg
+        : rawHeadingDeg;
 
-const grounded = isGroundedPoint(
-  idx > 0 ? currentTrackPoints[idx - 1] : null,
-  a,
-  b
-);
+    const grounded = isGroundedPoint(
+      idx > 0 ? currentTrackPoints[idx - 1] : null,
+      a,
+      b
+    );
 
-const headingAlpha = grounded ? 0.05 : 0.2;
+    const headingAlpha = grounded ? 0.12 : 0.2;
 
-smoothedCameraHeadingDeg = smoothHeadingDegrees(
-  smoothedCameraHeadingDeg,
-  headingToUse,
-  headingAlpha
-);
+    smoothedCameraHeadingDeg = smoothHeadingDegrees(
+      smoothedCameraHeadingDeg,
+      headingToUse,
+      headingAlpha
+    );
 
     const transform = getHeadingOnlyTransform(position, smoothedCameraHeadingDeg);
-
 
     const offset = new Cesium.Cartesian3(2, -30, 9);
 
@@ -2131,6 +2132,10 @@ for (let i = 0; i < animationPoints.length; i += 1) {
   const nextPoint = i < animationPoints.length - 1 ? animationPoints[i + 1] : null;
 
   const time = Cesium.JulianDate.fromIso8601(point.time);
+  const speedMps =
+    nextPoint ? computeSpeedMetersPerSecond(point, nextPoint)
+    : prevPoint ? computeSpeedMetersPerSecond(prevPoint, point)
+    : 0;
 
   let headingDeg = 0;
 let pitchDeg = 0;
@@ -2156,16 +2161,15 @@ if (grounded) {
   pitchDeg = 0;
   rollDeg = 0;
 
-  
-  smoothedGroundHeadingDeg = smoothHeadingDegrees(
-    smoothedGroundHeadingDeg,
-    headingDeg,
-    0.15
-  );
-
-  headingDeg = smoothedGroundHeadingDeg;
+  // If essentially not moving, keep last valid heading
+  if (speedMps < 2 && Number.isFinite(smoothedGroundHeadingDeg)) {
+    headingDeg = smoothedGroundHeadingDeg;
+  } else {
+    smoothedGroundHeadingDeg = headingDeg;
+  }
 } else {
   smoothedGroundHeadingDeg = headingDeg;
+
 }
 
 
