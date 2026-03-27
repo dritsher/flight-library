@@ -159,6 +159,48 @@
       #timelineButtons button {
         margin-bottom: 8px;
       }
+
+      .timeline-segment {
+        position: absolute;
+        left: calc(50% - 4px);
+        width: 8px;
+        border-radius: 0;
+      }
+      .timeline-segment:first-of-type { border-radius: 999px 999px 0 0; }
+      .timeline-segment:last-of-type  { border-radius: 0 0 999px 999px; }
+
+      .timeline-gap-label {
+        position: absolute;
+        left: 28px;
+        font-size: 8px;
+        color: rgba(0, 0, 0, 0.45);
+        white-space: nowrap;
+        pointer-events: none;
+        transform: translateY(-50%);
+      }
+
+      .timeline-airport-label {
+        position: absolute;
+        left: 30px;
+        font-size: 10px;
+        color: #e0e0e0;
+        white-space: nowrap;
+        pointer-events: none;
+        transform: translateY(-50%);
+        background: rgba(0, 0, 0, 0.5);
+        padding: 1px 5px;
+        border-radius: 3px;
+      }
+      .timeline-airport-label::before {
+        content: '';
+        position: absolute;
+        right: 100%;
+        top: 50%;
+        transform: translateY(-50%);
+        width: 8px;
+        height: 2px;
+        background: rgba(255, 255, 255, 0.6);
+      }
     </style>
   </head>
   <body>
@@ -212,6 +254,10 @@
         <label>
           <input type="checkbox" id="showTrackLine" checked />
           Show blue track line
+        </label>
+        <label>
+          <input type="checkbox" id="highlightSignalGaps" checked />
+          Highlight signal gaps (grey)
         </label>
         <label>
           <input type="checkbox" id="showTrailLine" checked />
@@ -355,8 +401,12 @@
       let outPointJulian = null;
 
       let currentTrackEntities = [];
+      let currentGapEntities = [];
+      let nearbyAirports = [];
       let userHasManuallySelectedModel = false;
       let currentModelBaseScale = 20;
+      let landedLatch = false;
+      let airportArrivalTimes = []; // [{ displayCode, isoTime }]
 
       let availableModels = [];
       let registrationMap = {};
@@ -646,6 +696,156 @@
         if (statusEl) statusEl.textContent = statusText || "--";
       }
 
+      function approxDistKm(lat1, lon1, lat2, lon2) {
+        const dLat = (lat2 - lat1) * 111.32;
+        const dLon =
+          (lon2 - lon1) * 111.32 * Math.cos((lat1 * Math.PI) / 180);
+        return Math.sqrt(dLat * dLat + dLon * dLon);
+      }
+
+      function findNearestAirport(lat, lon, maxKm = 8) {
+        let nearest = null;
+        let nearestDist = maxKm;
+        for (const airport of nearbyAirports) {
+          const dist = approxDistKm(lat, lon, airport.lat, airport.lon);
+          if (dist < nearestDist) {
+            nearestDist = dist;
+            nearest = airport;
+          }
+        }
+        return nearest;
+      }
+
+      async function fetchNearbyAirports(points) {
+        if (!points || points.length === 0) return [];
+
+        // Collect query points: first, last, plus one representative per
+        // ~1-degree cell among low-altitude points (captures all landing spots
+        // on multi-leg flights without making excessive API calls)
+        const LOW_ALT_M = 600;
+        const cellSeen = new Set();
+        const queryPoints = [];
+
+        const addQueryPoint = (pt) => {
+          const cell = `${Math.round(pt.lat)},${Math.round(pt.lon)}`;
+          if (!cellSeen.has(cell)) {
+            cellSeen.add(cell);
+            queryPoints.push(pt);
+          }
+        };
+
+        addQueryPoint(points[0]);
+        if (points.length > 1) addQueryPoint(points[points.length - 1]);
+
+        for (const p of points) {
+          const alt = Number.isFinite(p.alt) ? p.alt : Infinity;
+          if (alt <= LOW_ALT_M) addQueryPoint(p);
+        }
+
+        const seen = new Map();
+        for (const pt of queryPoints) {
+          try {
+            const res = await fetch(
+              `/flight-api/airports/near?lat=${pt.lat}&lon=${pt.lon}&radiusKm=15`,
+            );
+            if (!res.ok) continue;
+            const data = await res.json();
+            for (const airport of data.airports || []) {
+              const key = airport.icao || airport.iata || airport.name;
+              if (!seen.has(key)) seen.set(key, airport);
+            }
+          } catch (err) {
+            console.warn("[airports] fetch failed", err);
+          }
+        }
+        return Array.from(seen.values());
+      }
+
+      // Smooth lat/lon of slow ground points to reduce GPS jitter while taxiing/parking
+      function smoothGroundPoints(points) {
+        const SLOW_MPS = 15;
+        const PARKED_MPS = 3;
+        const WINDOW = 3;
+
+        // Pass 1: moving-average to reduce GPS jitter while taxiing
+        const smoothed = points.map((p, i) => {
+          const speed = i + 1 < points.length
+            ? computeSpeedMetersPerSecond(p, points[i + 1])
+            : i > 0 ? computeSpeedMetersPerSecond(points[i - 1], p) : 0;
+          if (speed >= SLOW_MPS) return p;
+
+          let sumLat = 0, sumLon = 0, count = 0;
+          for (let j = Math.max(0, i - WINDOW); j <= Math.min(points.length - 1, i + WINDOW); j += 1) {
+            sumLat += points[j].lat;
+            sumLon += points[j].lon;
+            count += 1;
+          }
+          return { ...p, lat: sumLat / count, lon: sumLon / count };
+        });
+
+        // Pass 2: snap every stopped run to its first point so GPS noise
+        // after parking doesn't cause the plane to drift from the stop position
+        const result = smoothed.slice();
+        let i = 0;
+        while (i < result.length) {
+          const speed = i + 1 < result.length
+            ? computeSpeedMetersPerSecond(result[i], result[i + 1])
+            : i > 0 ? computeSpeedMetersPerSecond(result[i - 1], result[i]) : 0;
+          if (speed < PARKED_MPS) {
+            // Find end of this stopped run
+            let j = i + 1;
+            while (j < result.length) {
+              const s = j + 1 < result.length
+                ? computeSpeedMetersPerSecond(result[j], result[j + 1])
+                : computeSpeedMetersPerSecond(result[j - 1], result[j]);
+              if (s >= PARKED_MPS) break;
+              j++;
+            }
+            // Snap all points in the run to the first one's position
+            const snapLat = result[i].lat;
+            const snapLon = result[i].lon;
+            for (let k = i + 1; k < j; k++) {
+              result[k] = { ...result[k], lat: snapLat, lon: snapLon };
+            }
+            i = j;
+          } else {
+            i++;
+          }
+        }
+        return result;
+      }
+
+      function addAirportTerrainOverlays() {
+        // Terrain clipping via Globe.clippingPlanes removed — Cesium culls
+        // entire terrain tiles rather than individual fragments, causing large
+        // regions to disappear. Aircraft altitude is handled via
+        // applyAirportElevationFloor instead.
+      }
+
+      function applyAirportElevationFloor(points, airports) {
+        if (!airports || airports.length === 0) return points;
+        return points.map((p) => {
+          const alt = Number.isFinite(p.alt) ? p.alt : 0;
+          if (alt > lowAltitudeThresholdM) return p;
+
+          let clampM = null;
+          let nearestDist = Infinity;
+          for (const airport of airports) {
+            const dist = approxDistKm(p.lat, p.lon, airport.lat, airport.lon);
+            if (dist < nearestDist) {
+              nearestDist = dist;
+              clampM = airport.elevationFt * 0.3048 + minClearanceM;
+            }
+          }
+
+          // Within 5km: clamp to airport elevation to suppress terrain jitter.
+          // Between 5–10km: only apply as a floor (don't push down).
+          if (clampM !== null && nearestDist < 5) return { ...p, alt: clampM };
+          if (clampM !== null && nearestDist < 10 && alt < clampM) return { ...p, alt: clampM };
+          return p;
+        });
+      }
+
       async function updateFlightDashboard() {
         if (
           !viewer ||
@@ -696,6 +896,8 @@
 
         let altitudeM = NaN;
         let aglM = NaN;
+        let currentLat = NaN;
+        let currentLon = NaN;
 
         const currentPosition = currentEntity.position.getValue(
           viewer.clock.currentTime,
@@ -704,6 +906,10 @@
           const cartographic =
             Cesium.Cartographic.fromCartesian(currentPosition);
           altitudeM = cartographic ? cartographic.height : NaN;
+          if (cartographic) {
+            currentLat = Cesium.Math.toDegrees(cartographic.latitude);
+            currentLon = Cesium.Math.toDegrees(cartographic.longitude);
+          }
 
           try {
             const sampled = await Cesium.sampleTerrainMostDetailed(
@@ -728,22 +934,31 @@
           }
         }
 
-        const landed = isLandedState({
+        const landedNow = isLandedState({
           aglM,
           speedMps,
           verticalSpeedMps,
           pitchDeg,
           rollDeg,
         });
+        // Hysteresis: latch landed state; only clear if clearly airborne
+        if (landedNow) {
+          landedLatch = true;
+        } else if (landedLatch && (aglM > 60 || speedMps > 120)) {
+          landedLatch = false;
+        }
+        const landed = landedLatch;
 
         const gapSeconds = computeTimeGapSeconds(a, b);
         const signalMissing = gapSeconds > SIGNAL_GAP_THRESHOLD_SECONDS;
 
         let statusText = "Airborne";
         if (signalMissing) {
-          statusText = "ADS-B Signal lost";
+          const nearAirport = findNearestAirport(currentLat, currentLon);
+          statusText = nearAirport ? `ADS-B Signal lost · ${nearAirport.name}` : "ADS-B Signal lost";
         } else if (landed) {
-          statusText = "Landed";
+          const airport = findNearestAirport(currentLat, currentLon);
+          statusText = airport ? `Landed · ${airport.name}` : "Landed";
         }
 
         updateDashboard({
@@ -752,6 +967,7 @@
           altitudeM,
           statusText,
         });
+
       }
 
       function computeSpeedMetersPerSecond(a, b) {
@@ -994,6 +1210,28 @@
 
           if (!Number.isFinite(dtSeconds) || dtSeconds <= maxStepSeconds) {
             continue;
+          }
+
+          // For signal gaps, check implied speed across the gap.
+          // If near zero the plane is parked — hold position to prevent drift.
+          // If significant, it's airborne — keep geodesic interpolation.
+          if (dtSeconds > SIGNAL_GAP_THRESHOLD_SECONDS) {
+            const dLat = (b.lat - a.lat) * 111320;
+            const dLon =
+              (b.lon - a.lon) * 111320 * Math.cos((a.lat * Math.PI) / 180);
+            const distM = Math.sqrt(dLat * dLat + dLon * dLon);
+            const impliedSpeedMps = distM / dtSeconds;
+            if (impliedSpeedMps < 30) {
+              // Parked or taxiing — freeze at last known position
+              densified.push({
+                time: new Date(t2 - 1000).toISOString(),
+                lat: a.lat,
+                lon: a.lon,
+                alt: a.alt,
+                _parkedHold: true,
+              });
+              continue;
+            }
           }
 
           const startCartographic = Cesium.Cartographic.fromDegrees(
@@ -1308,6 +1546,132 @@
         const trackHeight = 320;
         const y = (1 - clamp01(ratio)) * trackHeight;
         element.style.top = y + "px";
+      }
+
+      function buildTimelineSegments(sortedPoints) {
+        if (!sortedPoints || sortedPoints.length < 2) return [];
+        const segments = [];
+        let segStart = sortedPoints[0];
+        let segIsGap = computeTimeGapSeconds(sortedPoints[0], sortedPoints[1]) > SIGNAL_GAP_THRESHOLD_SECONDS;
+
+        for (let i = 1; i < sortedPoints.length - 1; i++) {
+          const nextIsGap = computeTimeGapSeconds(sortedPoints[i], sortedPoints[i + 1]) > SIGNAL_GAP_THRESHOLD_SECONDS;
+          if (nextIsGap !== segIsGap) {
+            segments.push({ startIso: segStart.time, endIso: sortedPoints[i].time, isGap: segIsGap });
+            segStart = sortedPoints[i];
+            segIsGap = nextIsGap;
+          }
+        }
+        segments.push({ startIso: segStart.time, endIso: sortedPoints[sortedPoints.length - 1].time, isGap: segIsGap });
+        return segments;
+      }
+
+      function renderTimelineTrack(segments) {
+        const container = document.getElementById("verticalTimeline");
+        const track = document.getElementById("timelineTrack");
+        if (!container) return;
+
+        container.querySelectorAll(".timeline-segment, .timeline-gap-label").forEach((el) => el.remove());
+
+        if (!segments || segments.length === 0) {
+          if (track) track.style.display = "";
+          return;
+        }
+        if (track) track.style.display = "none";
+
+        const TRACK_HEIGHT = 320;
+        const MIN_LABEL_SPACING_PX = 14;
+        let lastLabelTopPx = null;
+
+        segments.forEach((seg, idx) => {
+          const startJd = Cesium.JulianDate.fromIso8601(seg.startIso);
+          const endJd = Cesium.JulianDate.fromIso8601(seg.endIso);
+          const startRatio = getTimelineRatio(startJd);
+          const endRatio = getTimelineRatio(endJd);
+          const topPx = (1 - endRatio) * TRACK_HEIGHT;
+          const heightPx = (endRatio - startRatio) * TRACK_HEIGHT;
+          if (heightPx <= 0) return;
+
+          const el = document.createElement("div");
+          el.className = "timeline-segment";
+          // Round the very top of the first segment and bottom of the last
+          if (idx === 0) el.style.borderRadius = "999px 999px 0 0";
+          if (idx === segments.length - 1) el.style.borderRadius = el.style.borderRadius
+            ? "999px"
+            : "0 0 999px 999px";
+          el.style.top = `${topPx}px`;
+          el.style.height = `${heightPx}px`;
+          el.style.background = seg.isGap ? "#555" : "cyan";
+          container.appendChild(el);
+
+          // Time label at every transition (not the very first segment start)
+          if (idx > 0) {
+            const labelTopPx = (1 - startRatio) * TRACK_HEIGHT;
+            const tooClose = lastLabelTopPx !== null && Math.abs(labelTopPx - lastLabelTopPx) < MIN_LABEL_SPACING_PX;
+            if (!tooClose) {
+              const jsDate = Cesium.JulianDate.toDate(startJd);
+              const timeStr = jsDate.toISOString().substring(11, 16) + "z";
+              const label = document.createElement("div");
+              label.className = "timeline-gap-label";
+              label.textContent = timeStr;
+              label.style.top = `${labelTopPx}px`;
+              container.appendChild(label);
+              lastLabelTopPx = labelTopPx;
+            }
+          }
+        });
+      }
+
+      function computeAirportArrivals(smoothedPoints, airports) {
+        const arrivals = [];
+        const seen = new Set();
+        const NEAR_KM = 2;
+        const PARKED_MPS = 5;
+        for (const airport of airports) {
+          const key = airport.icao || airport.iata || airport.name;
+          if (seen.has(key)) continue;
+          for (let i = 0; i < smoothedPoints.length - 1; i++) {
+            const p = smoothedPoints[i];
+            if (approxDistKm(p.lat, p.lon, airport.lat, airport.lon) > NEAR_KM) continue;
+            const speed = computeSpeedMetersPerSecond(p, smoothedPoints[i + 1]);
+            if (speed < PARKED_MPS) {
+              seen.add(key);
+              const jd = Cesium.JulianDate.fromIso8601(p.time);
+              const jsDate = Cesium.JulianDate.toDate(jd);
+              const timeLabel = jsDate.toISOString().substring(11, 16) + " UTC";
+              arrivals.push({
+                displayCode: airport.icao || airport.iata || airport.name.substring(0, 4).toUpperCase(),
+                isoTime: p.time,
+                timeLabel,
+              });
+              break;
+            }
+          }
+        }
+        return arrivals;
+      }
+
+      function addAirportTimelineMarkers(arrivals) {
+        const container = document.getElementById("verticalTimeline");
+        if (!container) return;
+        container.querySelectorAll(".timeline-airport-label").forEach((el) => el.remove());
+        for (const arrival of arrivals) {
+          const { displayCode, isoTime } = arrival;
+          const jd = Cesium.JulianDate.fromIso8601(isoTime);
+          const ratio = getTimelineRatio(jd);
+          const label = document.createElement("div");
+          label.className = "timeline-airport-label";
+          label.textContent = displayCode;
+          if (arrival.timeLabel) {
+            const timeSpan = document.createElement("span");
+            timeSpan.textContent = " " + arrival.timeLabel;
+            timeSpan.style.opacity = "0.65";
+            timeSpan.style.fontSize = "9px";
+            label.appendChild(timeSpan);
+          }
+          setTimelineElementPosition(label, ratio);
+          container.appendChild(label);
+        }
       }
 
       function updateTimelineUI() {
@@ -2340,6 +2704,11 @@ async function exportFramesFromRange() {
         viewer.trackedEntity = undefined;
         currentTrackPoints = [];
         smoothedGroundHeadingDeg = null;
+        airportArrivalTimes = [];
+        renderTimelineTrack([]);
+        document.getElementById("verticalTimeline")
+          ?.querySelectorAll(".timeline-airport-label")
+          .forEach((el) => el.remove());
 
         if (dashboardHandler && viewer) {
           viewer.scene.preRender.removeEventListener(dashboardHandler);
@@ -2360,15 +2729,25 @@ async function exportFramesFromRange() {
         points.sort((a, b) => new Date(a.time) - new Date(b.time));
         if (points.length === 0) throw new Error("This flight has no points");
 
+        nearbyAirports = await fetchNearbyAirports(points);
+        landedLatch = false;
+
         const terrainAdjustedPoints = await applyLowAltitudeTerrainClearance(
           points,
           viewer,
           { lowAltitudeThresholdM: 120, minClearanceM: 3 },
         );
-        currentTrackPoints = terrainAdjustedPoints.slice();
+        const airportAdjustedPoints = applyAirportElevationFloor(
+          terrainAdjustedPoints,
+          nearbyAirports,
+        );
+        const smoothedPoints = smoothGroundPoints(airportAdjustedPoints);
+        currentTrackPoints = smoothedPoints.slice();
+        addAirportTerrainOverlays(nearbyAirports, smoothedPoints);
+        airportArrivalTimes = computeAirportArrivals(smoothedPoints, nearbyAirports);
         return {
           sortedPoints: points,
-          animationPoints: densifyTrackPointsGeodesic(terrainAdjustedPoints, 30),
+          animationPoints: densifyTrackPointsGeodesic(smoothedPoints, 30),
         };
       }
 
@@ -2418,19 +2797,35 @@ async function exportFramesFromRange() {
 
           rollDeg = computeApproxRollDegrees(prevPoint, point, nextPoint);
           if (Math.abs(rollDeg) < 1) rollDeg = 0;
+          // Zero roll below rotation speed — covers all ground ops at any elevation
+          if (speedMps < 50) rollDeg = 0;
 
-          const grounded = isGroundedPoint(prevPoint, point, nextPoint);
-          if (grounded) {
+          // Parked hold point: always freeze heading/pitch/roll regardless of altitude
+          if (point._parkedHold) {
             pitchDeg = 0;
             rollDeg = 0;
-            // If essentially not moving, keep last valid heading
-            if (speedMps < 2 && Number.isFinite(smoothedGroundHeadingDeg)) {
+            if (Number.isFinite(smoothedGroundHeadingDeg)) {
+              headingDeg = smoothedGroundHeadingDeg;
+            }
+          } else if (speedMps < 5) {
+            // Very slow (nearly stopped) — freeze heading, clear pitch/roll.
+            // Use speed-only check so high-elevation airports aren't excluded.
+            pitchDeg = 0;
+            rollDeg = 0;
+            if (Number.isFinite(smoothedGroundHeadingDeg)) {
               headingDeg = smoothedGroundHeadingDeg;
             } else {
               smoothedGroundHeadingDeg = headingDeg;
             }
           } else {
-            smoothedGroundHeadingDeg = headingDeg;
+            const grounded = isGroundedPoint(prevPoint, point, nextPoint);
+            if (grounded) {
+              pitchDeg = 0;
+              rollDeg = 0;
+              smoothedGroundHeadingDeg = headingDeg;
+            } else {
+              smoothedGroundHeadingDeg = headingDeg;
+            }
           }
 
           const hpr = new Cesium.HeadingPitchRoll(
@@ -2450,8 +2845,10 @@ async function exportFramesFromRange() {
       function addTrackEntity(sortedPoints) {
         const showTrackCheckbox = document.getElementById("showTrackLine");
         const visible = !showTrackCheckbox || showTrackCheckbox.checked;
+        const highlightGaps = document.getElementById("highlightSignalGaps")?.checked !== false;
 
         currentTrackEntities = [];
+        currentGapEntities = [];
 
         // Classify each segment as a signal gap or normal
         const segmentIsGap = sortedPoints.slice(0, -1).map((point, i) =>
@@ -2468,15 +2865,17 @@ async function exportFramesFromRange() {
               Cesium.Cartesian3.fromDegrees(p.lon, p.lat, p.alt || 0),
             );
             const isGap = segmentIsGap[groupStart];
+            const gapColor = highlightGaps ? Cesium.Color.GRAY : Cesium.Color.CYAN;
             const entity = viewer.entities.add({
               polyline: {
                 positions,
                 width: isGap ? 1 : 2,
-                material: isGap ? Cesium.Color.GRAY : Cesium.Color.CYAN,
+                material: isGap ? gapColor : Cesium.Color.CYAN,
               },
             });
             entity.show = visible;
             currentTrackEntities.push(entity);
+            if (isGap) currentGapEntities.push(entity);
             groupStart = i;
           }
         }
@@ -2586,12 +2985,7 @@ async function exportFramesFromRange() {
             position,
           );
           if (win) {
-            console.log("[dot screen]", {
-              x: win.x,
-              y: win.y,
-              canvasWidth: viewer.scene.canvas.clientWidth,
-              canvasHeight: viewer.scene.canvas.clientHeight,
-            });
+            // dot position available: win.x, win.y
           }
         };
         viewer.scene.postRender.addEventListener(viewer.__dotLogger);
@@ -2659,6 +3053,8 @@ async function exportFramesFromRange() {
         );
 
         setupClock(start, stop, preserveTime);
+        renderTimelineTrack(buildTimelineSegments(sortedPoints));
+        addAirportTimelineMarkers(airportArrivalTimes);
         addAircraftEntity(
           positionProperty,
           orientationProperty,
@@ -2736,6 +3132,17 @@ async function exportFramesFromRange() {
           if (currentProjectId && currentFlightId && viewer) {
             const savedTime = Cesium.JulianDate.clone(viewer.clock.currentTime);
             await loadCurrentFlight(savedTime);
+          }
+        });
+
+      document
+        .getElementById("highlightSignalGaps")
+        .addEventListener("change", function (e) {
+          const color = e.target.checked ? Cesium.Color.GRAY : Cesium.Color.CYAN;
+          const width = e.target.checked ? 1 : 2;
+          for (const entity of currentGapEntities) {
+            entity.polyline.material = color;
+            entity.polyline.width = width;
           }
         });
 

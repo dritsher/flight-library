@@ -9,6 +9,7 @@ const { promisify } = require("util");
 const execFileAsync = promisify(execFile);
 const { loadModelLibrary } = require("../services/modelLibrary");
 const { loadRegistrationLibrary } = require("../services/registrationLibrary");
+const { findAirportsNear } = require("../services/airportLibrary");
 
 const {
   PROJECTS_DIR,
@@ -627,6 +628,24 @@ router.get("/flight-api/registrations", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to load registrations" });
+  }
+});
+
+router.get("/flight-api/airports/near", (req, res) => {
+  try {
+    const lat = parseFloat(req.query.lat);
+    const lon = parseFloat(req.query.lon);
+    const radiusKm = Math.min(parseFloat(req.query.radiusKm) || 15, 50);
+
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      return res.status(400).json({ error: "lat and lon are required" });
+    }
+
+    const airports = findAirportsNear(lat, lon, radiusKm);
+    res.json({ airports });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to find nearby airports" });
   }
 });
 
