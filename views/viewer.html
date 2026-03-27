@@ -354,7 +354,7 @@
       let inPointJulian = null;
       let outPointJulian = null;
 
-      let trackEntity = null;
+      let currentTrackEntities = [];
       let userHasManuallySelectedModel = false;
       let currentModelBaseScale = 20;
 
@@ -1952,9 +1952,12 @@ async function exportFramesFromRange() {
           }
 
           const rawHeadingDeg = computeHeadingDegrees(a, b);
+          const isSignalGap =
+            computeTimeGapSeconds(a, b) > SIGNAL_GAP_THRESHOLD_SECONDS;
 
           const headingToUse =
-            rawHeadingDeg === 0 && Number.isFinite(smoothedCameraHeadingDeg)
+            (rawHeadingDeg === 0 || isSignalGap) &&
+            Number.isFinite(smoothedCameraHeadingDeg)
               ? smoothedCameraHeadingDeg
               : rawHeadingDeg;
 
@@ -2043,9 +2046,12 @@ async function exportFramesFromRange() {
           }
 
           const rawHeadingDeg = computeHeadingDegrees(a, b);
+          const isSignalGap =
+            computeTimeGapSeconds(a, b) > SIGNAL_GAP_THRESHOLD_SECONDS;
 
           const headingToUse =
-            rawHeadingDeg === 0 && Number.isFinite(smoothedCameraHeadingDeg)
+            (rawHeadingDeg === 0 || isSignalGap) &&
+            Number.isFinite(smoothedCameraHeadingDeg)
               ? smoothedCameraHeadingDeg
               : rawHeadingDeg;
 
@@ -2330,7 +2336,7 @@ async function exportFramesFromRange() {
         }
         viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
         viewer.entities.removeAll();
-        currentTrackEntity = null;
+        currentTrackEntities = [];
         viewer.trackedEntity = undefined;
         currentTrackPoints = [];
         smoothedGroundHeadingDeg = null;
@@ -2442,21 +2448,43 @@ async function exportFramesFromRange() {
       }
 
       function addTrackEntity(sortedPoints) {
-        const polylinePositions = sortedPoints.map((point) =>
-          Cesium.Cartesian3.fromDegrees(point.lon, point.lat, point.alt || 0),
-        );
-        currentTrackEntity = viewer.entities.add({
-          polyline: {
-            positions: polylinePositions,
-            width: 2,
-            material: Cesium.Color.CYAN,
-          },
-        });
         const showTrackCheckbox = document.getElementById("showTrackLine");
-        currentTrackEntity.show =
-          !showTrackCheckbox || showTrackCheckbox.checked;
-        currentBoundingSphere =
-          Cesium.BoundingSphere.fromPoints(polylinePositions);
+        const visible = !showTrackCheckbox || showTrackCheckbox.checked;
+
+        currentTrackEntities = [];
+
+        // Classify each segment as a signal gap or normal
+        const segmentIsGap = sortedPoints.slice(0, -1).map((point, i) =>
+          computeTimeGapSeconds(point, sortedPoints[i + 1]) >
+          SIGNAL_GAP_THRESHOLD_SECONDS,
+        );
+
+        // Group consecutive same-type segments into one polyline each
+        let groupStart = 0;
+        for (let i = 1; i <= segmentIsGap.length; i += 1) {
+          if (i === segmentIsGap.length || segmentIsGap[i] !== segmentIsGap[groupStart]) {
+            const groupPoints = sortedPoints.slice(groupStart, i + 1);
+            const positions = groupPoints.map((p) =>
+              Cesium.Cartesian3.fromDegrees(p.lon, p.lat, p.alt || 0),
+            );
+            const isGap = segmentIsGap[groupStart];
+            const entity = viewer.entities.add({
+              polyline: {
+                positions,
+                width: isGap ? 1 : 2,
+                material: isGap ? Cesium.Color.GRAY : Cesium.Color.CYAN,
+              },
+            });
+            entity.show = visible;
+            currentTrackEntities.push(entity);
+            groupStart = i;
+          }
+        }
+
+        const allPositions = sortedPoints.map((p) =>
+          Cesium.Cartesian3.fromDegrees(p.lon, p.lat, p.alt || 0),
+        );
+        currentBoundingSphere = Cesium.BoundingSphere.fromPoints(allPositions);
         return currentBoundingSphere;
       }
 
@@ -2689,15 +2717,10 @@ async function exportFramesFromRange() {
       document
         .getElementById("showTrackLine")
         .addEventListener("change", function (event) {
-          if (currentTrackEntity) {
-            currentTrackEntity.show = event.target.checked;
+          for (const entity of currentTrackEntities) {
+            entity.show = event.target.checked;
           }
         });
-
-      const toggle = document.getElementById("showTrailLine");
-      if (trackEntity && toggle) {
-        trackEntity.show = toggle.checked;
-      }
 
       document
         .getElementById("resolutionSelect")
